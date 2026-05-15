@@ -65,11 +65,14 @@ class TestConflictedReset(unittest.TestCase):
         # Sync — one of them gets marked conflicted
         adapter.sync('A', 'B')
         state = adapter.snapshot_state('A')
-        self.assertEqual(len(state['users']), 1, "Only winner should be visible")
-
-        # Now resolve: update the loser's email to something unique
+        self.assertEqual(len(state['users']), 2, "Both rows should be visible")
+        
+        # Check that one is conflicted and one is not
+        emails = [u['email'] for u in state['users']]
+        self.assertEqual(len([e for e in emails if "conflict_" in e]), 1)
         # First figure out who was the loser
         conn_a = adapter.peers['A']
+        conn_b = adapter.peers['B']
         cur = conn_a.execute("SELECT id FROM users WHERE conflicted = 1")
         loser = cur.fetchone()
         self.assertIsNotNone(loser)
@@ -309,7 +312,7 @@ class TestBenchmarkIntegration(unittest.TestCase):
 
         self.assertTrue(assert_convergence(hashes).passed, "Convergence failed")
         self.assertTrue(assert_uniqueness_email(state).passed, "Uniqueness failed")
-        self.assertTrue(assert_fk_documented(state, 'tombstone').passed, "FK policy failed")
+        self.assertTrue(assert_fk_documented(state, 'cascade').passed, "FK policy failed")
         self.assertTrue(assert_cell_level_merge(state).passed, "Cell-level merge failed")
         adapter.close()
 

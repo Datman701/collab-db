@@ -44,12 +44,12 @@ class TestRowMerge(unittest.TestCase):
         self.assertEqual(merged['name'], 'Alice')  # 'B' > 'A', so local wins
         self.assertEqual(merged['name_peer'], 'B')
 
-    def test_tombstone_preserved_when_cell_ts_gt_delete_ts(self):
-        """With permanent tombstones, row stays deleted even if cell ts > delete_ts."""
+    def test_tombstone_permanent_when_cell_ts_gt_delete_ts(self):
+        """Remove-Wins: tombstone stays even if cell ts > delete_ts."""
         local = {'id': 'u1', 'name': 'Alice', 'name_ts': 5, 'name_peer': 'A', 'tombstone': 1, 'delete_ts': 3}
         incoming = {'id': 'u1', 'name': 'Bob', 'name_ts': 2, 'name_peer': 'B'}
         merged = self.adapter._merge_row(incoming, local, ['name'])
-        # local cell wins (ts 5 > 2), but tombstone stays permanent
+        # local cell wins (ts 5 > 2), tombstone is permanent (Remove-Wins)
         self.assertEqual(merged['tombstone'], 1)
         self.assertEqual(merged['delete_ts'], 3)
 
@@ -57,7 +57,7 @@ class TestRowMerge(unittest.TestCase):
         local = {'id': 'u1', 'name': 'Alice', 'name_ts': 1, 'name_peer': 'A', 'tombstone': 1, 'delete_ts': 5}
         incoming = {'id': 'u1', 'name': 'Bob', 'name_ts': 2, 'name_peer': 'B'}
         merged = self.adapter._merge_row(incoming, local, ['name'])
-        # incoming wins cell (ts 2 > 1), but tombstone stays
+        # incoming wins cell (ts 2 > 1), but ts 2 <= delete_ts 5 → stays dead
         self.assertEqual(merged['tombstone'], 1)
         self.assertEqual(merged['delete_ts'], 5)
 

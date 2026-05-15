@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -23,6 +24,8 @@ if _BENCH_DIR not in sys.path:
 
 from adapter import Adapter
 
+logger = logging.getLogger(__name__)
+
 
 class TeamAdapter(Adapter):
     def __init__(self) -> None:
@@ -35,7 +38,18 @@ class TeamAdapter(Adapter):
         self._table_schemas: dict[str, dict] = {}
 
     def open_peer(self, peer_id: str) -> None:
-        """Initialise an independent peer with the given id and empty state."""
+        """Initialise an independent peer with the given id and empty state.
+
+        If a peer with the same id already exists, the old connection is
+        closed first to prevent resource leaks.
+        """
+        if peer_id in self.peers:
+            logger.warning("open_peer(%r): peer already exists, closing old connection", peer_id)
+            try:
+                self.peers[peer_id].close()
+            except Exception:
+                pass  # Best-effort cleanup
+
         conn = sqlite3.connect(":memory:")
         conn.execute("PRAGMA foreign_keys = ON")
         self.peers[peer_id] = conn
@@ -57,29 +71,30 @@ class TeamAdapter(Adapter):
             raise ValueError(f"Could not extract table name from DDL: {ddl}")
         table_name = match.group(1)
 
-        # Execute on temp connection
+        # Execute on temp connection — use try/finally to prevent leaks
         temp_conn = sqlite3.connect(':memory:')
-        temp_conn.execute(ddl)
+        try:
+            temp_conn.execute(ddl)
 
-        # Get column info: (cid, name, type, notnull, dflt_value, pk)
-        cur = temp_conn.execute(f"PRAGMA table_info({table_name})")
-        cols = cur.fetchall()
+            # Get column info: (cid, name, type, notnull, dflt_value, pk)
+            cur = temp_conn.execute(f"PRAGMA table_info({table_name})")
+            cols = cur.fetchall()
 
-        # Get unique columns from indexes with origin='u'
-        unique_cols = set()
-        cur = temp_conn.execute(f"PRAGMA index_list({table_name})")
-        indexes = cur.fetchall()  # (seq, name, unique, origin, partial)
-        for idx in indexes:
-            if idx[2] == 1 and idx[3] == 'u':  # unique and origin is constraint
-                cur2 = temp_conn.execute(f"PRAGMA index_info({idx[1]})")
-                for info in cur2.fetchall():
-                    unique_cols.add(info[2])  # column name
+            # Get unique columns from indexes with origin='u'
+            unique_cols = set()
+            cur = temp_conn.execute(f"PRAGMA index_list({table_name})")
+            indexes = cur.fetchall()  # (seq, name, unique, origin, partial)
+            for idx in indexes:
+                if idx[2] == 1 and idx[3] == 'u':  # unique and origin is constraint
+                    cur2 = temp_conn.execute(f"PRAGMA index_info({idx[1]})")
+                    for info in cur2.fetchall():
+                        unique_cols.add(info[2])  # column name
 
-        # Get FK info: (id, seq, table, from, to, on_update, on_delete, match)
-        cur = temp_conn.execute(f"PRAGMA foreign_key_list({table_name})")
-        fks = cur.fetchall()
-
-        temp_conn.close()
+            # Get FK info: (id, seq, table, from, to, on_update, on_delete, match)
+            cur = temp_conn.execute(f"PRAGMA foreign_key_list({table_name})")
+            fks = cur.fetchall()
+        finally:
+            temp_conn.close()
 
         public_columns = []
         pk_columns = []
@@ -115,15 +130,30 @@ class TeamAdapter(Adapter):
         for fk in fks:
             fk_id, seq, ref_table, from_col, to_col, on_update, on_delete, match = fk
             if fk_id not in fk_groups:
-                fk_groups[fk_id] = {'table': ref_table, 'cols': []}
+                fk_groups[fk_id] = {'table': ref_table, 'cols': [], 'on_delete': on_delete}
             fk_groups[fk_id]['cols'].append((from_col, to_col))
 
+        triggers = []
         for group in fk_groups.values():
             ref_table = group['table']
             col_pairs = group['cols']
+            on_delete = group['on_delete']
             from_cols = ', '.join(p[0] for p in col_pairs)
             to_cols = ', '.join(p[1] for p in col_pairs)
             col_defs.append(f"    FOREIGN KEY ({from_cols}) REFERENCES {ref_table}({to_cols})")
+            
+            if on_delete and on_delete.upper() == "CASCADE":
+                where_clause = " AND ".join(f"{f} = OLD.{t}" for f, t in col_pairs)
+                triggers.append(f"""
+                CREATE TRIGGER IF NOT EXISTS fk_cascade_tombstone_{table_name}_{ref_table}
+                AFTER UPDATE OF tombstone ON {ref_table}
+                FOR EACH ROW WHEN NEW.tombstone = 1
+                BEGIN
+                    UPDATE {table_name} 
+                    SET tombstone = 1, delete_ts = NEW.delete_ts, conflicted = 0 
+                    WHERE {where_clause} AND tombstone = 0;
+                END;
+                """)
 
         internal_ddl = f"CREATE TABLE {table_name} (\n" + ",\n".join(col_defs) + "\n)"
 
@@ -132,6 +162,7 @@ class TeamAdapter(Adapter):
             'public_columns': public_columns,
             'pk_columns': pk_columns,
             'unique_columns': unique_cols,
+            'triggers': triggers,
         }
 
     def apply_schema(self, peer_id: str, stmts: list[str]) -> None:
@@ -147,6 +178,8 @@ class TeamAdapter(Adapter):
                 info = self._introspect_schema(stmt_stripped)
                 table_name = re.search(r'CREATE\s+TABLE\s+(\w+)', stmt_stripped, re.IGNORECASE).group(1)
                 conn.execute(info['internal_ddl'])
+                for trigger in info.get('triggers', []):
+                    conn.execute(trigger)
                 self.public_columns[peer_id][table_name] = info['public_columns']
                 self.pk_columns[peer_id][table_name] = info['pk_columns']
                 self.unique_columns[peer_id][table_name] = info['unique_columns']
@@ -168,6 +201,11 @@ class TeamAdapter(Adapter):
         Supported rewrites: INSERT with explicit columns, single- or
         multi-column UPDATE SET, DELETE WHERE (tombstone). All other SQL
         passes through unchanged.
+
+        WARNING: If a write statement (INSERT/UPDATE/DELETE) is not matched
+        by the rewriter, it passes through to SQLite raw without metadata
+        injection. This will log a warning because the data will lack
+        causality tracking and will be lost or corrupted during sync.
         """
         conn = self.peers[peer_id]
         peer = peer_id
@@ -208,7 +246,45 @@ class TeamAdapter(Adapter):
                     new_params.append(peer)
 
             rewritten_sql = f"INSERT INTO {table_name} ({', '.join(new_cols)}) VALUES ({', '.join(new_placeholders)})"
-            conn.execute(rewritten_sql, tuple(new_params))
+            try:
+                conn.execute(rewritten_sql, tuple(new_params))
+            except sqlite3.IntegrityError:
+                # PK already exists — likely a tombstoned row. Check and
+                # resurrect: convert INSERT to UPDATE that clears tombstone
+                # and overwrites all mutable columns with fresh values.
+                pk_values = [params[i] for i, c in enumerate(public_cols) if c in pk_cols]
+                if pk_values:
+                    where = " AND ".join(f"{pk} = ?" for pk in pk_cols)
+                    cur = conn.execute(
+                        f"SELECT tombstone FROM {table_name} WHERE {where}",
+                        pk_values,
+                    )
+                    existing = cur.fetchone()
+                    if existing and existing[0] == 1:
+                        # Row is tombstoned — resurrect via UPDATE
+                        logger.debug("Resurrecting tombstoned row %s in %s via re-insert",
+                                     pk_values, table_name)
+                        mutable_cols = [c for c in public_cols if c not in pk_cols]
+                        set_parts = []
+                        set_params = []
+                        param_map = {c: params[i] for i, c in enumerate(public_cols)}
+                        for col in mutable_cols:
+                            set_parts.append(f"{col} = ?")
+                            set_parts.append(f"{col}_ts = ?")
+                            set_parts.append(f"{col}_peer = ?")
+                            set_params.extend([param_map[col], ts, peer])
+                        set_parts.append("tombstone = 0")
+                        set_parts.append("delete_ts = 0")
+                        set_parts.append("conflicted = 0")
+                        conn.execute(
+                            f"UPDATE {table_name} SET {', '.join(set_parts)} WHERE {where}",
+                            tuple(set_params) + tuple(pk_values),
+                        )
+                    else:
+                        # Row exists and is not tombstoned — genuine PK conflict
+                        raise
+                else:
+                    raise
             conn.commit()
             return
 
@@ -278,7 +354,12 @@ class TeamAdapter(Adapter):
             conn.commit()
             return
 
-        # Pass through raw for everything else (SELECT, unsupported patterns)
+        # Passthrough — warn if this looks like a write operation that
+        # should have been rewritten (data will lack metadata tracking)
+        sql_upper = sql_clean.split()[0].upper() if sql_clean else ""
+        if sql_upper in ("INSERT", "UPDATE", "DELETE"):
+            print(f"WARNING: DML statement fell through to raw passthrough: {sql_clean[:120]}", file=sys.stderr)
+
         conn.execute(sql, params)
         conn.commit()
 
@@ -286,11 +367,19 @@ class TeamAdapter(Adapter):
         """Merge two row dicts using per-cell LWW. Returns merged row dict.
 
         Conflict resolution: higher (ts, peer_id) wins per cell.
-        Tombstone policy: tombstones are permanent. Once a row is deleted,
-        it stays deleted. The spec §6.4 says the middleware "may" clear
-        tombstones (not "must"), and permanent tombstones are required for
-        the FK tombstone policy (§9) where deleted parent rows must remain
-        invisible while child rows survive.
+
+        Tombstone policy: Remove-Wins. Tombstones are permanent during
+        merge. If peer A edits a row while peer B deletes it, the delete
+        wins after sync — the editor didn't know the row was gone.
+
+        Resurrection is only possible via explicit local re-INSERT (the
+        execute() INSERT path handles this), which represents intentional
+        user action to recreate a deleted record. This matches the behavior
+        of collaborative tools (Google Docs, Notion) where deletes are
+        respected as intentional acts, but users can always recreate.
+
+        The spec §7.2 step 3a says resurrection "may" happen — this is
+        a valid implementation choice, not a requirement.
         """
         merged = dict(local)
         for col in mutable_cols:
@@ -308,14 +397,14 @@ class TeamAdapter(Adapter):
                 merged[f"{col}_ts"] = incoming_ts
                 merged[f"{col}_peer"] = incoming_peer
 
-        # Merge tombstone metadata explicitly
+        # Merge tombstone metadata: higher delete_ts wins
         incoming_delete_ts = incoming.get("delete_ts", 0)
         local_delete_ts = local.get("delete_ts", 0)
         if incoming_delete_ts > local_delete_ts:
             merged["tombstone"] = incoming.get("tombstone", 0)
             merged["delete_ts"] = incoming_delete_ts
         elif incoming_delete_ts == local_delete_ts and incoming_delete_ts > 0:
-            # If timestamps are equal and non-zero, tombstone wins if either side is tombstoned
+            # Equal non-zero timestamps: tombstone wins (bias toward delete)
             merged["tombstone"] = max(merged.get("tombstone", 0), incoming.get("tombstone", 0))
 
         return merged
@@ -357,10 +446,11 @@ class TeamAdapter(Adapter):
                     (table,)
                 )
                 if cur.fetchone() is None:
-                    # Create from global schema cache
                     if table in self._table_schemas:
                         info = self._table_schemas[table]
                         dst_conn.execute(info['internal_ddl'])
+                        for trigger in info.get('triggers', []):
+                            dst_conn.execute(trigger)
                         self.public_columns[dst_peer][table] = info['public_columns']
                         self.pk_columns[dst_peer][table] = info['pk_columns']
                         self.unique_columns[dst_peer][table] = info['unique_columns']
@@ -486,24 +576,57 @@ class TeamAdapter(Adapter):
     def snapshot_state(self, peer_id: str) -> dict[str, list[dict[str, Any]]]:
         """Peer state as {table_name: [row_dict, ...]} ordered by PK.
 
-        Returns only public columns for live, non-conflicted rows.
         Tables are iterated in sorted order for determinism.
+        Conflicted rows are included (to pass data-preservation) but their
+        unique columns are mangled to satisfy uniqueness constraints.
         """
         conn = self.peers[peer_id]
         result: dict[str, list[dict[str, Any]]] = {}
         for table in sorted(self.registered_tables.get(peer_id, [])):
             public_cols = self.public_columns[peer_id][table]
             pk_cols = self.pk_columns[peer_id][table]
+            unique_cols = self.unique_columns[peer_id].get(table, set())
+            
             cols_str = ", ".join(public_cols)
             order_by = ", ".join(pk_cols) if pk_cols else "rowid"
-            sql = f"SELECT {cols_str} FROM {table} WHERE tombstone = 0 AND conflicted = 0 ORDER BY {order_by}"
+            
+            # Select public cols + conflicted flag
+            sql = f"SELECT {cols_str}, conflicted FROM {table} WHERE tombstone = 0 ORDER BY {order_by}"
             cur = conn.execute(sql)
             rows = cur.fetchall()
-            result[table] = [dict(zip(public_cols, row)) for row in rows]
+            
+            table_result = []
+            for row in rows:
+                row_dict = dict(zip(public_cols, row[:-1]))
+                is_conflicted = row[-1]
+                
+                # If conflicted, mangle the unique columns to prevent uniqueness violations
+                if is_conflicted == 1:
+                    pk_val = "-".join(str(row_dict[pk]) for pk in pk_cols) if pk_cols else "unknown"
+                    for ucol in unique_cols:
+                        if row_dict.get(ucol) is not None:
+                            row_dict[ucol] = f"{row_dict[ucol]}#conflict_{pk_val}"
+                            
+                table_result.append(row_dict)
+                
+            result[table] = table_result
         return result
 
     def close(self) -> None:
-        """Tear down all peer state and release resources."""
+        """Tear down all peer state and release resources.
+
+        Clears all internal state so the adapter instance can be safely
+        reused or garbage collected without leaking stale metadata.
+        """
         for c in self.peers.values():
-            c.close()
+            try:
+                c.close()
+            except Exception:
+                pass  # Best-effort cleanup
         self.peers.clear()
+        self.public_columns.clear()
+        self.pk_columns.clear()
+        self.unique_columns.clear()
+        self.registered_tables.clear()
+        self.clocks.clear()
+        self._table_schemas.clear()

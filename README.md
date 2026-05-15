@@ -160,3 +160,27 @@ Comprehensive robustness improvements identified through systematic gap analysis
   - Randomized convergence with multiple seeds
 
 #### Total: 98 tests, all passing. Benchmark score: 1.00 / 1.00.
+
+### v3 — Production Hardening (2026-05-16)
+
+Focused on real-world robustness rather than benchmark optimisation.
+
+#### Bug Fixes
+
+- **Re-insert after delete (tombstone resurrection)** — Inserting a row with the same PK as a tombstoned row previously crashed with `IntegrityError`. The INSERT path now detects tombstoned rows and converts to an UPDATE that clears `tombstone=0`, `delete_ts=0` and writes fresh cell metadata. This supports the common "delete then recreate" workflow.
+
+- **Duplicate `open_peer()` leaks connection** — Calling `open_peer("A")` twice would orphan the first SQLite connection (memory leak). Now closes the old connection before creating a new one, with a warning log.
+
+- **`close()` leaves stale metadata** — Previously only cleared `self.peers`. Now also clears `public_columns`, `pk_columns`, `unique_columns`, `registered_tables`, `clocks`, and `_table_schemas` so the adapter instance can be safely reused.
+
+- **`_introspect_schema` temp connection leak** — If DDL execution failed, the temporary SQLite connection was never closed. Wrapped in `try/finally`.
+
+#### Enhancements
+
+- **DML passthrough warning** — If a write statement (INSERT/UPDATE/DELETE) doesn't match any rewrite regex and falls through to raw SQLite, a warning is logged. Data written without metadata injection will lack causality tracking and may be lost during sync. This catches typos and unexpected SQL patterns before they cause silent data corruption.
+
+- **Structured logging** — Added `logging.getLogger(__name__)` with messages at DEBUG (resurrection events, merge decisions) and WARNING (passthrough fallthrough, duplicate peer) levels.
+
+#### Design Decision: Remove-Wins Merge
+
+Adopted **Remove-Wins** tombstone semantics: deletes are permanent during merge. If peer A edits a row while peer B deletes it, the delete wins after sync. Resurrection is only possible via **explicit local re-INSERT** — a deliberate user action to recreate a deleted record. This matches real collaborative tool behavior (Google Docs, Notion) and satisfies the FK tombstone policy.

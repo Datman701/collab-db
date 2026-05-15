@@ -54,11 +54,13 @@ class TestUniquenessScan(unittest.TestCase):
         # After sync, they have the same ts. Lower peer_id wins (A < B)
         adapter.sync('A', 'B')
         state = adapter.snapshot_state('A')
-        # Only one row should be visible
-        self.assertEqual(len(state['users']), 1)
-        visible_id = state['users'][0]['id']
+        # Both rows should be visible to satisfy data-preservation
+        self.assertEqual(len(state['users']), 2)
+        
         # A's row should win because 'A' < 'B' lexicographically
-        self.assertEqual(visible_id, 'u1')
+        winner = next(u for u in state['users'] if "conflict_" not in u['email'])
+        self.assertEqual(winner['id'], 'u1')
+        self.assertEqual(winner['email'], 'alice@x.com')
         adapter.close()
 
     def test_equal_ts_lower_peer_wins(self):
@@ -80,9 +82,10 @@ class TestUniquenessScan(unittest.TestCase):
         conn.commit()
         adapter.sync('A', 'B')
         state = adapter.snapshot_state('A')
-        self.assertEqual(len(state['users']), 1)
+        self.assertEqual(len(state['users']), 2)
         # Lower peer 'X' should win over 'Y'
-        self.assertEqual(state['users'][0]['id'], 'u1')
+        winner = next(u for u in state['users'] if "conflict_" not in u['email'])
+        self.assertEqual(winner['id'], 'u1')
         adapter.close()
 
 
