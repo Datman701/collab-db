@@ -9,7 +9,7 @@ A local-first relational database adapter with deterministic offline replication
 ## Quick Start
 
 ```bash
-# Run unit tests (65 tests)
+# Run unit tests (98 tests)
 python3 run_tests.py
 
 # Run benchmark self-check
@@ -64,7 +64,8 @@ Each peer is an independent in-memory SQLite connection. Writes are transparentl
 │   ├── test_task7.py            # Row merge algorithm (unit)
 │   ├── test_task8.py            # Full sync (extract, merge, auto-create)
 │   ├── test_task9.py            # Post-sync uniqueness scan
-│   └── test_task10.py           # Integration + gap coverage tests
+│   ├── test_task10.py           # Integration + gap coverage tests
+│   └── test_task11_adversarial.py  # Adversarial & stress tests (33 tests)
 ├── SPEC.md                      # Full technical specification
 ├── PLAN.md                      # Implementation plan with task breakdown
 ├── GRILL_SESSION.md             # Design decision Q&A session
@@ -146,4 +147,16 @@ Comprehensive robustness improvements identified through systematic gap analysis
 
 - **Updated `test_task8.test_sync_merges_conflicting_rows`** — Adjusted expected behavior to account for clock synchronization (equal timestamps → peer_id tiebreak)
 
-#### Total: 65 tests, all passing. Benchmark score: 1.00 / 1.00.
+- **33 adversarial tests** in `test_task11_adversarial.py` covering:
+  - N-peer convergence (4+ peers)
+  - Sync-order invariance (exhaustive permutations)
+  - Three-way uniqueness conflicts
+  - FK tombstone cascading behavior
+  - Stable cell winner under repeated sync
+  - Sync idempotence across full mesh
+  - Snapshot hash stability and hiding composites
+  - SQL rewriter robustness (whitespace, case, multi-line)
+  - Unicode safety
+  - Randomized convergence with multiple seeds
+
+#### Total: 98 tests, all passing. Benchmark score: 1.00 / 1.00.
