@@ -6,11 +6,13 @@ offline replication using per-cell metadata in SQLite.
 """
 from __future__ import annotations
 
-import sqlite3
-from typing import Any
-
-import sys
+import hashlib
+import json
 import os
+import re
+import sqlite3
+import sys
+from typing import Any
 
 # When this module is imported from within bench-p01-crdt/adapters/team.py,
 # we need to ensure the bench-p01-crdt directory is on sys.path so that
@@ -33,6 +35,7 @@ class TeamAdapter(Adapter):
         self._table_schemas: dict[str, dict] = {}
 
     def open_peer(self, peer_id: str) -> None:
+        """Initialise an independent peer with the given id and empty state."""
         conn = sqlite3.connect(":memory:")
         conn.execute("PRAGMA foreign_keys = ON")
         self.peers[peer_id] = conn
@@ -43,9 +46,11 @@ class TeamAdapter(Adapter):
         self.clocks[peer_id] = 0
 
     def _introspect_schema(self, ddl: str) -> dict:
-        """Introspect a CREATE TABLE DDL and return internal schema info."""
-        import re
+        """Introspect a CREATE TABLE DDL and return internal schema info.
 
+        Returns a dict with keys: internal_ddl, public_columns, pk_columns,
+        unique_columns.
+        """
         # Extract table name
         match = re.search(r'CREATE\s+TABLE\s+(\w+)', ddl, re.IGNORECASE)
         if not match:
@@ -130,7 +135,11 @@ class TeamAdapter(Adapter):
         }
 
     def apply_schema(self, peer_id: str, stmts: list[str]) -> None:
-        import re
+        """Apply DDL statements to a peer.
+
+        CREATE TABLE statements are intercepted, introspected, and regenerated
+        with metadata columns. CREATE INDEX passes through unchanged.
+        """
         conn = self.peers[peer_id]
         for stmt in stmts:
             stmt_stripped = stmt.strip()
@@ -141,7 +150,9 @@ class TeamAdapter(Adapter):
                 self.public_columns[peer_id][table_name] = info['public_columns']
                 self.pk_columns[peer_id][table_name] = info['pk_columns']
                 self.unique_columns[peer_id][table_name] = info['unique_columns']
-                self.registered_tables[peer_id].append(table_name)
+                # Prevent duplicate table registration
+                if table_name not in self.registered_tables[peer_id]:
+                    self.registered_tables[peer_id].append(table_name)
                 # Store globally for auto-creation during sync
                 self._table_schemas[table_name] = info
             elif re.match(r'CREATE\s+INDEX', stmt_stripped, re.IGNORECASE):
@@ -152,30 +163,38 @@ class TeamAdapter(Adapter):
         conn.commit()
 
     def execute(self, peer_id: str, sql: str, params: tuple[Any, ...] = ()) -> None:
-        import re
+        """Execute a single DML statement locally on a peer.
+
+        Supported rewrites: INSERT with explicit columns, single- or
+        multi-column UPDATE SET, DELETE WHERE (tombstone). All other SQL
+        passes through unchanged.
+        """
         conn = self.peers[peer_id]
         peer = peer_id
-        
+
+        # Normalize: strip trailing semicolons and extra whitespace
+        sql_clean = sql.strip().rstrip(';').strip()
+
         # Try INSERT rewrite
         insert_match = re.match(
             r"INSERT\s+INTO\s+(\w+)\s+\(([^)]+)\)\s+VALUES\s+\(([^)]+)\)",
-            sql.strip(),
+            sql_clean,
             re.IGNORECASE,
         )
         if insert_match:
             table_name = insert_match.group(1)
             public_cols = [c.strip() for c in insert_match.group(2).split(",")]
             placeholders = [p.strip() for p in insert_match.group(3).split(",")]
-            
+
             pk_cols = self.pk_columns[peer_id].get(table_name, [])
-            
+
             new_cols = []
             new_placeholders = []
             new_params = []
-            
+
             self.clocks[peer_id] += 1
             ts = self.clocks[peer_id]
-            
+
             for i, col in enumerate(public_cols):
                 new_cols.append(col)
                 new_placeholders.append(placeholders[i])
@@ -187,61 +206,91 @@ class TeamAdapter(Adapter):
                     new_placeholders.append("?")
                     new_params.append(ts)
                     new_params.append(peer)
-            
+
             rewritten_sql = f"INSERT INTO {table_name} ({', '.join(new_cols)}) VALUES ({', '.join(new_placeholders)})"
             conn.execute(rewritten_sql, tuple(new_params))
             conn.commit()
             return
-        
-        # Try single-column UPDATE rewrite
+
+        # Try UPDATE rewrite — supports single- and multi-column SET
         update_match = re.match(
-            r"UPDATE\s+(\w+)\s+SET\s+(\w+)\s*=\s*\?\s+WHERE\s+(.+)",
-            sql.strip(),
-            re.IGNORECASE,
+            r"UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+)",
+            sql_clean,
+            re.IGNORECASE | re.DOTALL,
         )
         if update_match:
             table_name = update_match.group(1)
-            col = update_match.group(2)
-            where_clause = update_match.group(3)
-            
-            self.clocks[peer_id] += 1
-            ts = self.clocks[peer_id]
-            
-            rewritten_sql = f"UPDATE {table_name} SET {col} = ?, {col}_ts = ?, {col}_peer = ? WHERE {where_clause}"
-            new_params = (params[0], ts, peer) + params[1:]
-            conn.execute(rewritten_sql, new_params)
-            conn.commit()
-            return
-        
+            set_clause = update_match.group(2).strip()
+            where_clause = update_match.group(3).strip()
+
+            # Parse SET assignments: "col1 = ?, col2 = ?" → [col1, col2]
+            assignments = [a.strip() for a in set_clause.split(",")]
+            set_cols = []
+            for assignment in assignments:
+                col_match = re.match(r"(\w+)\s*=\s*\?", assignment)
+                if col_match:
+                    set_cols.append(col_match.group(1))
+                else:
+                    # Non-standard SET pattern — fall through to raw passthrough
+                    set_cols = None
+                    break
+
+            if set_cols:
+                self.clocks[peer_id] += 1
+                ts = self.clocks[peer_id]
+
+                # Build new SET clause with metadata for each column
+                new_set_parts = []
+                new_params_list = []
+                param_idx = 0
+                for col in set_cols:
+                    new_set_parts.append(f"{col} = ?")
+                    new_set_parts.append(f"{col}_ts = ?")
+                    new_set_parts.append(f"{col}_peer = ?")
+                    new_params_list.append(params[param_idx])
+                    new_params_list.append(ts)
+                    new_params_list.append(peer)
+                    param_idx += 1
+
+                rewritten_sql = f"UPDATE {table_name} SET {', '.join(new_set_parts)} WHERE {where_clause}"
+                # Append remaining params (WHERE clause params)
+                new_params_tuple = tuple(new_params_list) + params[param_idx:]
+                conn.execute(rewritten_sql, new_params_tuple)
+                conn.commit()
+                return
+
         # Try DELETE rewrite (tombstone UPDATE)
         delete_match = re.match(
             r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+(.+)",
-            sql.strip(),
+            sql_clean,
             re.IGNORECASE,
         )
         if delete_match:
             table_name = delete_match.group(1)
             where_clause = delete_match.group(2)
-            
+
             self.clocks[peer_id] += 1
             ts = self.clocks[peer_id]
-            
+
             rewritten_sql = f"UPDATE {table_name} SET tombstone = 1, delete_ts = ? WHERE {where_clause}"
             new_params = (ts,) + params
             conn.execute(rewritten_sql, new_params)
             conn.commit()
             return
-        
+
         # Pass through raw for everything else (SELECT, unsupported patterns)
         conn.execute(sql, params)
         conn.commit()
 
     def _merge_row(self, incoming: dict, local: dict, mutable_cols: list[str]) -> dict:
         """Merge two row dicts using per-cell LWW. Returns merged row dict.
-        
-        Tombstones are permanent: once a row is deleted, it stays deleted.
-        Updates on tombstoned rows update cell metadata but do not resurrect the row.
-        This matches the benchmark's expected behavior for FK policy tests.
+
+        Conflict resolution: higher (ts, peer_id) wins per cell.
+        Tombstone policy: tombstones are permanent. Once a row is deleted,
+        it stays deleted. The spec §6.4 says the middleware "may" clear
+        tombstones (not "must"), and permanent tombstones are required for
+        the FK tombstone policy (§9) where deleted parent rows must remain
+        invisible while child rows survive.
         """
         merged = dict(local)
         for col in mutable_cols:
@@ -249,7 +298,7 @@ class TeamAdapter(Adapter):
             local_ts = local.get(f"{col}_ts", 0)
             incoming_peer = incoming.get(f"{col}_peer", "")
             local_peer = local.get(f"{col}_peer", "")
-            
+
             if incoming_ts > local_ts:
                 merged[col] = incoming[col]
                 merged[f"{col}_ts"] = incoming_ts
@@ -258,7 +307,7 @@ class TeamAdapter(Adapter):
                 merged[col] = incoming[col]
                 merged[f"{col}_ts"] = incoming_ts
                 merged[f"{col}_peer"] = incoming_peer
-        
+
         # Merge tombstone metadata explicitly
         incoming_delete_ts = incoming.get("delete_ts", 0)
         local_delete_ts = local.get("delete_ts", 0)
@@ -268,14 +317,24 @@ class TeamAdapter(Adapter):
         elif incoming_delete_ts == local_delete_ts and incoming_delete_ts > 0:
             # If timestamps are equal and non-zero, tombstone wins if either side is tombstoned
             merged["tombstone"] = max(merged.get("tombstone", 0), incoming.get("tombstone", 0))
-        
+
         return merged
 
     def _sync_one_way(self, src_peer: str, dst_peer: str) -> None:
-        """Merge all state from src_peer into dst_peer."""
+        """Merge all state from src_peer into dst_peer.
+
+        Uses explicit UPDATE for existing rows to avoid INSERT OR REPLACE
+        which triggers DELETE+INSERT internally and can violate FK constraints.
+        Also synchronises the logical clock so the destination peer's clock
+        is at least as high as the source peer's clock.
+        """
         src_conn = self.peers[src_peer]
         dst_conn = self.peers[dst_peer]
-        
+
+        # Synchronise clocks: dst should be at least as high as src
+        if self.clocks[src_peer] > self.clocks[dst_peer]:
+            self.clocks[dst_peer] = self.clocks[src_peer]
+
         # Build sync payload from source
         schema_manifest = {}
         rows_payload = {}
@@ -285,10 +344,13 @@ class TeamAdapter(Adapter):
             cur = src_conn.execute(f"SELECT * FROM {table}")
             cols = [d[0] for d in cur.description]
             rows_payload[table] = [dict(zip(cols, row)) for row in cur.fetchall()]
-        
+
+        # Temporarily disable FK checks during merge to avoid transient violations
+        dst_conn.execute("PRAGMA foreign_keys = OFF")
+
         # Apply to destination
         for table, rows in rows_payload.items():
-            # Auto-create table if absent
+            # Auto-create table if absent (with dedup guard)
             if table not in self.registered_tables.get(dst_peer, []):
                 cur = dst_conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
@@ -302,7 +364,8 @@ class TeamAdapter(Adapter):
                         self.public_columns[dst_peer][table] = info['public_columns']
                         self.pk_columns[dst_peer][table] = info['pk_columns']
                         self.unique_columns[dst_peer][table] = info['unique_columns']
-                        self.registered_tables[dst_peer].append(table)
+                        if table not in self.registered_tables.get(dst_peer, []):
+                            self.registered_tables[dst_peer].append(table)
                 else:
                     # Table exists physically but not registered — register it
                     if table in self._table_schemas:
@@ -310,11 +373,12 @@ class TeamAdapter(Adapter):
                         self.public_columns[dst_peer][table] = info['public_columns']
                         self.pk_columns[dst_peer][table] = info['pk_columns']
                         self.unique_columns[dst_peer][table] = info['unique_columns']
-                        self.registered_tables[dst_peer].append(table)
-            
+                        if table not in self.registered_tables.get(dst_peer, []):
+                            self.registered_tables[dst_peer].append(table)
+
             pk_cols = self.pk_columns[src_peer].get(table, [])
             mutable_cols = [c for c in self.public_columns[src_peer].get(table, []) if c not in pk_cols]
-            
+
             for incoming_row in rows:
                 # Build PK where clause
                 pk_values = [incoming_row[pk] for pk in pk_cols]
@@ -323,38 +387,53 @@ class TeamAdapter(Adapter):
                     cur = dst_conn.execute(f"SELECT * FROM {table} WHERE {where}", pk_values)
                 else:
                     cur = dst_conn.execute(f"SELECT * FROM {table} WHERE rowid = ?", (incoming_row.get('rowid'),))
-                
+
                 local_row = cur.fetchone()
                 if local_row is None:
-                    # Insert incoming row as-is
+                    # Insert incoming row as-is (no existing row to conflict with)
                     all_cols = list(incoming_row.keys())
                     placeholders = ",".join("?" * len(all_cols))
                     dst_conn.execute(
-                        f"INSERT OR REPLACE INTO {table} ({','.join(all_cols)}) VALUES ({placeholders})",
+                        f"INSERT INTO {table} ({','.join(all_cols)}) VALUES ({placeholders})",
                         tuple(incoming_row.values()),
                     )
                 else:
-                    # Merge
+                    # Merge and use UPDATE to avoid DELETE+INSERT FK issues
                     cols = [d[0] for d in cur.description]
                     local_dict = dict(zip(cols, local_row))
                     merged = self._merge_row(incoming_row, local_dict, mutable_cols)
-                    all_cols = list(merged.keys())
-                    placeholders = ",".join("?" * len(all_cols))
+
+                    # Build UPDATE SET clause for all columns except PKs
+                    non_pk_cols = [c for c in merged.keys() if c not in pk_cols]
+                    set_clause = ", ".join(f"{c} = ?" for c in non_pk_cols)
+                    set_values = [merged[c] for c in non_pk_cols]
+                    where_clause = " AND ".join(f"{pk} = ?" for pk in pk_cols)
+                    where_values = [merged[pk] for pk in pk_cols]
+
                     dst_conn.execute(
-                        f"INSERT OR REPLACE INTO {table} ({','.join(all_cols)}) VALUES ({placeholders})",
-                        tuple(merged.values()),
+                        f"UPDATE {table} SET {set_clause} WHERE {where_clause}",
+                        tuple(set_values + where_values),
                     )
-        
+
         dst_conn.commit()
+        # Re-enable FK checks after merge
+        dst_conn.execute("PRAGMA foreign_keys = ON")
 
     def sync(self, peer_a: str, peer_b: str) -> None:
+        """Pairwise bidirectional sync. After return, both peers reflect
+        the union of each other's known state per LWW merge semantics."""
         self._sync_one_way(peer_b, peer_a)
         self._sync_one_way(peer_a, peer_b)
         self._uniqueness_scan(peer_a)
         self._uniqueness_scan(peer_b)
 
     def _uniqueness_scan(self, peer_id: str) -> None:
-        """After sync, scan for duplicate unique values and mark losers conflicted."""
+        """After sync, scan for duplicate unique values and mark losers conflicted.
+
+        Resets all conflicted flags first so that previously-conflicted rows
+        whose uniqueness violation has been resolved become visible again.
+        Skips NULL values (SQL NULL != NULL, so NULLs are never duplicates).
+        """
         conn = self.peers[peer_id]
         for table in self.registered_tables.get(peer_id, []):
             unique_cols = self.unique_columns[peer_id].get(table, set())
@@ -362,7 +441,10 @@ class TeamAdapter(Adapter):
             if not unique_cols or not pk_cols:
                 continue
             pk_col = pk_cols[0]  # Assume single-column PK
-            
+
+            # Reset all conflicted flags so resolved duplicates become visible
+            conn.execute(f"UPDATE {table} SET conflicted = 0 WHERE conflicted = 1")
+
             for ucol in unique_cols:
                 ts_col = f"{ucol}_ts"
                 peer_col = f"{ucol}_peer"
@@ -371,13 +453,15 @@ class TeamAdapter(Adapter):
                     f"SELECT {pk_col}, {ucol}, {ts_col}, {peer_col} FROM {table} WHERE tombstone = 0 AND conflicted = 0"
                 )
                 rows = cur.fetchall()
-                
-                # Group by unique column value
+
+                # Group by unique column value, skipping NULLs
                 groups: dict[str, list[tuple]] = {}
                 for row in rows:
                     pk_val, uval, ts_val, peer_val = row
+                    if uval is None:
+                        continue  # NULL values are never considered duplicates
                     groups.setdefault(uval, []).append((pk_val, ts_val, peer_val))
-                
+
                 # For each group with duplicates, mark losers
                 for uval, group_rows in groups.items():
                     if len(group_rows) <= 1:
@@ -394,15 +478,20 @@ class TeamAdapter(Adapter):
         conn.commit()
 
     def snapshot_hash(self, peer_id: str) -> str:
-        import hashlib, json
+        """Deterministic hex hash of the peer's full visible state."""
         state = self.snapshot_state(peer_id)
         blob = json.dumps(state, sort_keys=True, default=str).encode()
         return hashlib.sha256(blob).hexdigest()
 
     def snapshot_state(self, peer_id: str) -> dict[str, list[dict[str, Any]]]:
+        """Peer state as {table_name: [row_dict, ...]} ordered by PK.
+
+        Returns only public columns for live, non-conflicted rows.
+        Tables are iterated in sorted order for determinism.
+        """
         conn = self.peers[peer_id]
         result: dict[str, list[dict[str, Any]]] = {}
-        for table in self.registered_tables.get(peer_id, []):
+        for table in sorted(self.registered_tables.get(peer_id, [])):
             public_cols = self.public_columns[peer_id][table]
             pk_cols = self.pk_columns[peer_id][table]
             cols_str = ", ".join(public_cols)
@@ -414,6 +503,7 @@ class TeamAdapter(Adapter):
         return result
 
     def close(self) -> None:
+        """Tear down all peer state and release resources."""
         for c in self.peers.values():
             c.close()
         self.peers.clear()

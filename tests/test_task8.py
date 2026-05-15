@@ -72,9 +72,10 @@ class TestSync(unittest.TestCase):
         adapter.apply_schema('A', SCHEMA)
         adapter.apply_schema('B', SCHEMA)
         adapter.execute('A', "INSERT INTO users (id, email, name) VALUES (?, ?, ?)", ('u1', 'alice@x.com', 'Alice'))
-        # Sync so B gets u1
+        # Sync so B gets u1 — clock sync bumps B's clock to match A's (1)
         adapter.sync('A', 'B')
-        # A updates at ts=2, B updates at ts=1 (B's clock was 0)
+        # Both updates now get ts=2 (clocks are synchronized).
+        # With equal timestamps, higher peer_id wins: 'B' > 'A' lexicographically.
         adapter.execute('A', "UPDATE users SET name = ? WHERE id = ?", ('Alice Cooper', 'u1'))
         adapter.execute('B', "UPDATE users SET name = ? WHERE id = ?", ('Alicia', 'u1'))
         adapter.sync('A', 'B')
@@ -82,9 +83,9 @@ class TestSync(unittest.TestCase):
         u1_a = next(r for r in state_a['users'] if r['id'] == 'u1')
         state_b = adapter.snapshot_state('B')
         u1_b = next(r for r in state_b['users'] if r['id'] == 'u1')
-        # A should win because A has higher ts (2 > 1)
-        self.assertEqual(u1_a['name'], 'Alice Cooper')
-        self.assertEqual(u1_b['name'], 'Alice Cooper')
+        # B wins because equal ts, and 'B' > 'A' lexicographically
+        self.assertEqual(u1_a['name'], 'Alicia')
+        self.assertEqual(u1_b['name'], 'Alicia')
         adapter.close()
 
     def test_sync_cell_level_merge(self):
