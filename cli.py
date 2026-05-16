@@ -152,6 +152,7 @@ def perform_remote_sync(adapter: TeamAdapter, peer_id: str, remote_url: str) -> 
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    print(f"[sync] connecting to {remote_url}")
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             response_text = response.read().decode("utf-8")
@@ -174,8 +175,7 @@ def perform_remote_sync(adapter: TeamAdapter, peer_id: str, remote_url: str) -> 
 def sync_worker(adapter: TeamAdapter, peer_id: str, remote_peers: list[str], interval: int, stop_event: threading.Event) -> None:
     while not stop_event.wait(interval):
         for remote in remote_peers:
-            if perform_remote_sync(adapter, peer_id, remote):
-                print(f"[sync] synced with {remote}")
+            perform_remote_sync(adapter, peer_id, remote)
 
 
 def repl(adapter: TeamAdapter, peer_id: str, remote_peers: list[str]) -> None:

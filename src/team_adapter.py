@@ -227,6 +227,11 @@ class TeamAdapter(Adapter):
             # Normalize: strip trailing semicolons and extra whitespace
             sql_clean = sql.strip().rstrip(';').strip()
 
+            # Try CREATE TABLE rewrite to ensure internal metadata columns exist.
+            if re.match(r"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+\w+", sql_clean, re.IGNORECASE):
+                self.apply_schema(peer_id, [sql_clean])
+                return
+
             # Try INSERT rewrite
             insert_match = re.match(
                 r"INSERT\s+INTO\s+(\w+)\s+\(([^)]+)\)\s+VALUES\s+\(([^)]+)\)",
@@ -396,14 +401,66 @@ class TeamAdapter(Adapter):
         if sql_upper in ("INSERT", "UPDATE", "DELETE"):
             print(f"WARNING: DML statement fell through to raw passthrough: {sql_clean[:120]}", file=sys.stderr)
 
-            conn.execute(sql, params)
-            conn.commit()
+        conn.execute(sql, params)
+        conn.commit()
+
+    def _rewrite_select_query(self, peer_id: str, sql: str) -> str:
+        """Rewrite top-level SELECT queries to hide metadata columns."""
+        match = re.match(
+            r"^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<table>\w+)(?P<alias>(?:\s+AS\s+\w+|\s+\w+)?)?(?P<rest>.*)$",
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return sql
+
+        select_list = match.group("select").strip()
+        table_name = match.group("table")
+        alias_part = (match.group("alias") or "").strip()
+        rest = match.group("rest") or ""
+        reserved = {"WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "JOIN", "UNION", "HAVING"}
+        if alias_part and alias_part.split()[0].upper() in reserved:
+            rest = f" {alias_part}{rest}"
+            alias_part = ""
+
+        alias_name = table_name
+        if alias_part:
+            alias_name = alias_part.split()[-1]
+
+        prefix = ""
+        raw_select = select_list
+        prefix_match = re.match(r"(?i)^(DISTINCT|ALL)\s+(.+)$", select_list)
+        if prefix_match:
+            prefix = prefix_match.group(1).upper() + " "
+            raw_select = prefix_match.group(2)
+
+        if raw_select == "*" or raw_select.endswith(".*"):
+            public_cols = self.public_columns[peer_id].get(table_name, [])
+            if not public_cols:
+                return sql
+            if raw_select.endswith(".*"):
+                public_cols = [f"{alias_name}.{col}" for col in public_cols]
+            select_list = f"{prefix}{', '.join(public_cols)}"
+
+        lower_rest = rest.lower()
+        if "where" not in lower_rest:
+            rest = f" WHERE {alias_name}.tombstone = 0{rest}"
+        elif "tombstone" not in lower_rest:
+            rest = re.sub(
+                r"(?i)\bwhere\b",
+                f"WHERE {alias_name}.tombstone = 0 AND ",
+                rest,
+                count=1,
+            )
+
+        return f"SELECT {select_list} FROM {table_name}{(' ' + alias_part) if alias_part else ''}{rest}"
 
     def query(self, peer_id: str, sql: str, params: tuple[Any, ...] = ()) -> tuple[list[str], list[tuple[Any, ...]]]:
         """Execute a SQL query on a peer and return column names and rows."""
         with self._lock:
             conn = self.peers[peer_id]
-            cur = conn.execute(sql, params)
+            rewritten_sql = self._rewrite_select_query(peer_id, sql) if sql.strip().upper().startswith("SELECT") else sql
+            cur = conn.execute(rewritten_sql, params)
             rows = cur.fetchall()
             columns = [d[0] for d in cur.description] if cur.description else []
             return columns, rows
