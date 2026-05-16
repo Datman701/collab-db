@@ -13,9 +13,9 @@ A local-first relational database adapter with deterministic offline replication
 cd tests
 python3 run_tests.py
 
-# Run benchmark self-check
+# Run benchmark test-run
 cd bench-p01-crdt
-python3 self_check.py --adapter adapters.team:TeamAdapter --fk-policy tombstone
+python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone 
 
 # Full run with custom randomized seeds
 python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone \
