@@ -15,10 +15,10 @@ python3 run_tests.py
 
 # Run benchmark test-run
 cd bench-p01-crdt
-python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone 
+python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone --out l3_report.json
 
 # Full run with custom randomized seeds
-python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone \
+python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone --out l3_report.json \
   --randomized-seeds 9999 31415 27182 --rand-peers 5 --rand-ops 150
 ```
 
