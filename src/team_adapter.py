@@ -247,10 +247,15 @@ class TeamAdapter(Adapter):
                 self.clocks[peer_id] += 1
                 ts = self.clocks[peer_id]
 
+                use_literal_values = len(params) == 0 and all(p != "?" for p in placeholders)
+
                 for i, col in enumerate(public_cols):
                     new_cols.append(col)
-                    new_placeholders.append(placeholders[i])
-                    new_params.append(params[i])
+                    if use_literal_values:
+                        new_placeholders.append(placeholders[i])
+                    else:
+                        new_placeholders.append(placeholders[i])
+                        new_params.append(params[i])
                     if col not in pk_cols:
                         new_cols.append(f"{col}_ts")
                         new_cols.append(f"{col}_peer")
