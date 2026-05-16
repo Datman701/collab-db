@@ -39,13 +39,13 @@ class TestSchemaIntrospection(unittest.TestCase):
     def test_introspect_users_unique_columns(self):
         adapter = TeamAdapter()
         result = adapter._introspect_schema(USERS_DDL)
-        self.assertEqual(result['unique_columns'], {'email'})
+        self.assertEqual(result['unique_columns'], [('email',)])
 
     def test_introspect_orders_unique_columns(self):
         adapter = TeamAdapter()
         result = adapter._introspect_schema(ORDERS_DDL)
         # orders has no UNIQUE columns
-        self.assertEqual(result['unique_columns'], set())
+        self.assertEqual(result['unique_columns'], [])
 
     def test_introspect_orders_fk_stripped(self):
         adapter = TeamAdapter()
