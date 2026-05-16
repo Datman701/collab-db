@@ -10,6 +10,7 @@ A local-first relational database adapter with deterministic offline replication
 
 ```bash
 # Run unit tests (98 tests)
+cd tests
 python3 run_tests.py
 
 # Run benchmark self-check
@@ -77,7 +78,7 @@ Each peer is an independent in-memory SQLite connection. Writes are transparentl
 ## Key Design Decisions
 
 | Decision | Rationale |
-|----------|-----------|
+|--|--
 | **Permanent tombstones** | Spec §6.4 says middleware "may" resurrect rows; we keep tombstones permanent to satisfy FK tombstone policy (§9) where deleted parents must remain invisible |
 | **Full state sync** | Simple, correct, O(n) per sync — acceptable for benchmark-scale datasets |
 | **Regex-based SQL rewriting** | Avoids a SQL parser; handles the exact patterns the benchmark generates |
