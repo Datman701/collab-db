@@ -359,14 +359,14 @@ class TeamAdapter(Adapter):
             table_name = delete_match.group(1)
             where_clause = delete_match.group(2)
 
-                self.clocks[peer_id] += 1
-                ts = self.clocks[peer_id]
+            self.clocks[peer_id] += 1
+            ts = self.clocks[peer_id]
 
-                rewritten_sql = f"UPDATE {table_name} SET tombstone = 1, delete_ts = ? WHERE {where_clause}"
-                new_params = (ts,) + params
-                conn.execute(rewritten_sql, new_params)
-                conn.commit()
-                return
+            rewritten_sql = f"UPDATE {table_name} SET tombstone = 1, delete_ts = ? WHERE {where_clause}"
+            new_params = (ts,) + params
+            conn.execute(rewritten_sql, new_params)
+            conn.commit()
+            return
 
         # Try DELETE rewrite — bare DELETE without WHERE (tombstone all rows)
         bare_delete_match = re.match(
@@ -712,6 +712,128 @@ class TeamAdapter(Adapter):
                 
             result[table] = table_result
         return result
+
+    def export_peer_state(self, peer_id: str) -> dict[str, Any]:
+        """Export a full peer state payload suitable for remote sync.
+
+        Returns a dict with keys: 'rows' -> {table: [row_dict, ...]},
+        'schemas' -> {table: public_columns}, and 'clock' -> logical clock.
+        This payload is consumed by `import_peer_state` on the remote side.
+        """
+        with self._lock:
+            conn = self.peers[peer_id]
+            rows_payload: dict[str, list[dict[str, Any]]] = {}
+            schemas: dict[str, list[str]] = {}
+            for table in self.registered_tables.get(peer_id, []):
+                schemas[table] = list(self.public_columns[peer_id].get(table, []))
+                cur = conn.execute(f"SELECT * FROM {table}")
+                cols = [d[0] for d in cur.description]
+                rows_payload[table] = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+            return {"rows": rows_payload, "schemas": schemas, "clock": self.clocks.get(peer_id, 0)}
+
+    def import_peer_state(self, peer_id: str, state: dict[str, Any]) -> None:
+        """Import a remote peer state payload into local peer storage.
+
+        The state can be the payload produced by `export_peer_state` or a
+        simple mapping {table: [row_dict,...]}. The import attempts to
+        auto-create missing tables (best-effort) and insert/merge rows.
+        """
+        with self._lock:
+            if peer_id not in self.peers:
+                raise KeyError(f"peer {peer_id!r} is not open")
+            conn = self.peers[peer_id]
+
+            # Normalize incoming format
+            if isinstance(state, dict) and "rows" in state:
+                rows_payload = state["rows"]
+                schemas = state.get("schemas", {})
+                incoming_clock = state.get("clock", 0)
+            elif isinstance(state, dict) and all(isinstance(v, list) for v in state.values()):
+                rows_payload = state
+                schemas = {}
+                incoming_clock = 0
+            else:
+                raise ValueError("Unrecognized state payload format")
+
+            # Temporarily disable FK checks during merge
+            conn.execute("PRAGMA foreign_keys = OFF")
+
+            for table, rows in rows_payload.items():
+                # Ensure table exists; try to auto-create from known schema
+                if table not in self.registered_tables.get(peer_id, []):
+                    cur = conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                        (table,),
+                    )
+                    if cur.fetchone() is None:
+                        # Attempt to create table from stored schema if available
+                        if table in self._table_schemas:
+                            info = self._table_schemas[table]
+                            conn.execute(info["internal_ddl"])
+                            for trig in info.get("triggers", []):
+                                conn.execute(trig)
+                            self.public_columns[peer_id][table] = list(info.get("public_columns", []))
+                            self.pk_columns[peer_id][table] = list(info.get("pk_columns", []))
+                            self.unique_columns[peer_id][table] = set(info.get("unique_columns", []))
+                            self.registered_tables[peer_id].append(table)
+                        else:
+                            # Fallback: infer columns from first row
+                            if not rows:
+                                # Nothing to create
+                                continue
+                            sample = rows[0]
+                            cols = list(sample.keys())
+                            # Use generic TEXT types for inferred columns
+                            col_defs = []
+                            for c in cols:
+                                if c in ("tombstone", "delete_ts", "conflicted"):
+                                    if c == "tombstone" or c == "conflicted":
+                                        col_defs.append(f"{c} INTEGER DEFAULT 0")
+                                    else:
+                                        col_defs.append(f"{c} INTEGER DEFAULT 0")
+                                else:
+                                    col_defs.append(f"{c} TEXT")
+                            ddl = f"CREATE TABLE {table} ({', '.join(col_defs)})"
+                            conn.execute(ddl)
+                            self.public_columns[peer_id][table] = [c for c in cols if not c.endswith("_ts") and not c.endswith("_peer")]
+                            self.pk_columns[peer_id][table] = []
+                            self.unique_columns[peer_id][table] = set()
+                            self.registered_tables[peer_id].append(table)
+
+                # Insert or update rows
+                pk_cols = self.pk_columns[peer_id].get(table, [])
+                for incoming_row in rows:
+                    try:
+                        all_cols = list(incoming_row.keys())
+                        placeholders = ",".join("?" for _ in all_cols)
+                        conn.execute(
+                            f"INSERT INTO {table} ({', '.join(all_cols)}) VALUES ({placeholders})",
+                            tuple(incoming_row[c] for c in all_cols),
+                        )
+                    except sqlite3.IntegrityError:
+                        # PK conflict — best-effort UPDATE of non-PK columns
+                        if pk_cols:
+                            where = " AND ".join(f"{pk} = ?" for pk in pk_cols)
+                            where_vals = tuple(incoming_row.get(pk) for pk in pk_cols)
+                            non_pk = [c for c in incoming_row.keys() if c not in pk_cols]
+                            if non_pk:
+                                set_clause = ", ".join(f"{c} = ?" for c in non_pk)
+                                vals = tuple(incoming_row[c] for c in non_pk) + where_vals
+                                conn.execute(
+                                    f"UPDATE {table} SET {set_clause} WHERE {where}",
+                                    vals,
+                                )
+                        else:
+                            # No PK defined — ignore conflict
+                            logger.debug("Skipping conflicting row for table %s with no PK", table)
+
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys = ON")
+
+            # Advance logical clock conservatively
+            if incoming_clock and incoming_clock > self.clocks.get(peer_id, 0):
+                self.clocks[peer_id] = incoming_clock
 
     def close(self) -> None:
         """Tear down all peer state and release resources.

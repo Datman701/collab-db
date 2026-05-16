@@ -97,6 +97,12 @@ class CLIHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return
         try:
             self.server.adapter.import_peer_state(peer_id, state)
+            # Notify locally that we received a sync from a remote peer
+            try:
+                addr = f"{self.client_address[0]}:{self.client_address[1]}"
+            except Exception:
+                addr = "unknown"
+            print(f"[sync] received sync from {addr} for peer {peer_id}")
             response_state = self.server.adapter.export_peer_state(peer_id)
             self._send_json({"peer_state": response_state})
         except Exception as exc:
@@ -155,6 +161,7 @@ def perform_remote_sync(adapter: TeamAdapter, peer_id: str, remote_url: str) -> 
                 print(f"[sync] remote did not return peer_state: {body}")
                 return False
             adapter.import_peer_state(peer_id, remote_state)
+            print(f"[sync] synced with {remote_url}")
             return True
     except urllib.error.URLError as exc:
         print(f"[sync] could not reach {remote_url}: {exc}")
