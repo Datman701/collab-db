@@ -90,7 +90,7 @@ class TestApplySchema(unittest.TestCase):
         adapter = TeamAdapter()
         adapter.open_peer('A')
         adapter.apply_schema('A', SCHEMA)
-        self.assertEqual(adapter.unique_columns['A']['users'], {'email'})
+        self.assertEqual(adapter.unique_columns['A']['users'], [('email',)])
         adapter.close()
 
     def test_apply_schema_creates_index(self):

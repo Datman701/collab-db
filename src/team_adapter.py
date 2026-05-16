@@ -34,7 +34,7 @@ class TeamAdapter(Adapter):
         self.peers: dict[str, sqlite3.Connection] = {}
         self.public_columns: dict[str, dict[str, list[str]]] = {}
         self.pk_columns: dict[str, dict[str, list[str]]] = {}
-        self.unique_columns: dict[str, dict[str, set[str]]] = {}
+        self.unique_columns: dict[str, dict[str, list[tuple[str, ...]]]] = {}
         self.registered_tables: dict[str, list[str]] = {}
         self.clocks: dict[str, int] = {}
         self._table_schemas: dict[str, dict] = {}
@@ -89,15 +89,18 @@ class TeamAdapter(Adapter):
             cur = temp_conn.execute(f"PRAGMA table_info({table_name})")
             cols = cur.fetchall()
 
-            # Get unique columns from indexes with origin='u'
-            unique_cols = set()
+            # Get unique constraints as column-groups (list of tuples).
+            # A UNIQUE(user_id, team_id) becomes one tuple ('user_id', 'team_id').
+            # A single UNIQUE(email) becomes one tuple ('email',).
+            unique_constraints: list[tuple[str, ...]] = []
             cur = temp_conn.execute(f"PRAGMA index_list({table_name})")
             indexes = cur.fetchall()  # (seq, name, unique, origin, partial)
             for idx in indexes:
                 if idx[2] == 1 and idx[3] == 'u':  # unique and origin is constraint
                     cur2 = temp_conn.execute(f"PRAGMA index_info({idx[1]})")
-                    for info in cur2.fetchall():
-                        unique_cols.add(info[2])  # column name
+                    constraint_cols = tuple(info[2] for info in cur2.fetchall())
+                    if constraint_cols:
+                        unique_constraints.append(constraint_cols)
 
             # Get FK info: (id, seq, table, from, to, on_update, on_delete, match)
             cur = temp_conn.execute(f"PRAGMA foreign_key_list({table_name})")
@@ -170,7 +173,7 @@ class TeamAdapter(Adapter):
             'internal_ddl': internal_ddl,
             'public_columns': public_columns,
             'pk_columns': pk_columns,
-            'unique_columns': unique_cols,
+            'unique_columns': unique_constraints,
             'triggers': triggers,
         }
 
@@ -346,15 +349,15 @@ class TeamAdapter(Adapter):
                     conn.commit()
                     return
 
-            # Try DELETE rewrite (tombstone UPDATE)
-            delete_match = re.match(
-                r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+(.+)",
-                sql_clean,
-                re.IGNORECASE,
-            )
-            if delete_match:
-                table_name = delete_match.group(1)
-                where_clause = delete_match.group(2)
+        # Try DELETE rewrite (tombstone UPDATE) — with WHERE clause
+        delete_match = re.match(
+            r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+(.+)",
+            sql_clean,
+            re.IGNORECASE,
+        )
+        if delete_match:
+            table_name = delete_match.group(1)
+            where_clause = delete_match.group(2)
 
                 self.clocks[peer_id] += 1
                 ts = self.clocks[peer_id]
@@ -365,11 +368,28 @@ class TeamAdapter(Adapter):
                 conn.commit()
                 return
 
-            # Passthrough — warn if this looks like a write operation that
-            # should have been rewritten (data will lack metadata tracking)
-            sql_upper = sql_clean.split()[0].upper() if sql_clean else ""
-            if sql_upper in ("INSERT", "UPDATE", "DELETE"):
-                print(f"WARNING: DML statement fell through to raw passthrough: {sql_clean[:120]}", file=sys.stderr)
+        # Try DELETE rewrite — bare DELETE without WHERE (tombstone all rows)
+        bare_delete_match = re.match(
+            r"DELETE\s+FROM\s+(\w+)\s*$",
+            sql_clean,
+            re.IGNORECASE,
+        )
+        if bare_delete_match:
+            table_name = bare_delete_match.group(1)
+
+            self.clocks[peer_id] += 1
+            ts = self.clocks[peer_id]
+
+            rewritten_sql = f"UPDATE {table_name} SET tombstone = 1, delete_ts = ? WHERE tombstone = 0"
+            conn.execute(rewritten_sql, (ts,))
+            conn.commit()
+            return
+
+        # Passthrough — warn if this looks like a write operation that
+        # should have been rewritten (data will lack metadata tracking)
+        sql_upper = sql_clean.split()[0].upper() if sql_clean else ""
+        if sql_upper in ("INSERT", "UPDATE", "DELETE"):
+            print(f"WARNING: DML statement fell through to raw passthrough: {sql_clean[:120]}", file=sys.stderr)
 
             conn.execute(sql, params)
             conn.commit()
@@ -526,8 +546,14 @@ class TeamAdapter(Adapter):
                     )
 
         dst_conn.commit()
-        # Re-enable FK checks after merge
+        # Re-enable FK checks after merge and validate integrity
         dst_conn.execute("PRAGMA foreign_keys = ON")
+        fk_violations = dst_conn.execute("PRAGMA foreign_key_check").fetchall()
+        if fk_violations:
+            logger.warning(
+                "FK violations detected after sync on peer %r: %d violations (first 5: %s)",
+                dst_peer, len(fk_violations), fk_violations[:5],
+            )
 
     def sync(self, peer_a: str, peer_b: str) -> None:
         """Pairwise bidirectional sync. After return, both peers reflect
@@ -540,40 +566,84 @@ class TeamAdapter(Adapter):
     def _uniqueness_scan(self, peer_id: str) -> None:
         """After sync, scan for duplicate unique values and mark losers conflicted.
 
+        Uses a two-pass approach to avoid interference between constraints:
+          Pass 1: Detect all losers across ALL unique constraints.
+          Pass 2: Apply conflicted=1 to all losers at once.
+
+        Handles composite UNIQUE constraints correctly by grouping on
+        the full column tuple, not individual columns.
+
         Resets all conflicted flags first so that previously-conflicted rows
         whose uniqueness violation has been resolved become visible again.
         Skips NULL values (SQL NULL != NULL, so NULLs are never duplicates).
         """
         conn = self.peers[peer_id]
         for table in self.registered_tables.get(peer_id, []):
-            unique_cols = self.unique_columns[peer_id].get(table, set())
+            unique_constraints = self.unique_columns[peer_id].get(table, [])
             pk_cols = self.pk_columns[peer_id].get(table, [])
-            if not unique_cols or not pk_cols:
+            if not unique_constraints or not pk_cols:
                 continue
-            pk_col = pk_cols[0]  # Assume single-column PK
+
 
             # Reset all conflicted flags so resolved duplicates become visible
             conn.execute(f"UPDATE {table} SET conflicted = 0 WHERE conflicted = 1")
 
-            for ucol in unique_cols:
-                ts_col = f"{ucol}_ts"
-                peer_col = f"{ucol}_peer"
-                # Fetch all visible rows with this unique column
+            # Pass 1: Collect ALL loser PKs across all constraints
+            loser_pks: set[tuple] = set()
+
+            for constraint_cols in unique_constraints:
+                # Build SELECT for this constraint's columns + their metadata
+                select_parts = list(pk_cols)  # always need PKs
+                for ucol in constraint_cols:
+                    ts_col = f"{ucol}_ts"
+                    peer_col = f"{ucol}_peer"
+                    select_parts.extend([ucol, ts_col, peer_col])
+
+                select_str = ", ".join(select_parts)
                 cur = conn.execute(
-                    f"SELECT {pk_col}, {ucol}, {ts_col}, {peer_col} FROM {table} WHERE tombstone = 0 AND conflicted = 0"
+                    f"SELECT {select_str} FROM {table} WHERE tombstone = 0 AND conflicted = 0"
                 )
                 rows = cur.fetchall()
 
-                # Group by unique column value, skipping NULLs
-                groups: dict[str, list[tuple]] = {}
-                for row in rows:
-                    pk_val, uval, ts_val, peer_val = row
-                    if uval is None:
-                        continue  # NULL values are never considered duplicates
-                    groups.setdefault(uval, []).append((pk_val, ts_val, peer_val))
+                # Parse each row
+                n_pk = len(pk_cols)
+                n_ucols = len(constraint_cols)
 
-                # For each group with duplicates, mark losers
-                for uval, group_rows in groups.items():
+                # Group by the composite unique key value
+                groups: dict[tuple, list[tuple]] = {}
+                for row in rows:
+                    pk_val = tuple(row[:n_pk])
+
+                    # Extract unique column values and metadata
+                    key_parts = []
+                    min_ts = None
+                    min_peer = None
+                    has_null = False
+                    for i, ucol in enumerate(constraint_cols):
+                        offset = n_pk + i * 3
+                        uval = row[offset]
+                        ts_val = row[offset + 1]
+                        peer_val = row[offset + 2]
+                        if uval is None:
+                            has_null = True
+                            break
+                        key_parts.append(uval)
+                        # For tie-breaking: use the MIN (ts, peer) across
+                        # the constraint columns as the row's "priority"
+                        if min_ts is None or (ts_val, peer_val) < (min_ts, min_peer):
+                            min_ts = ts_val
+                            min_peer = peer_val
+
+                    if has_null:
+                        continue  # NULL values are never considered duplicates
+
+                    group_key = tuple(key_parts)
+                    groups.setdefault(group_key, []).append(
+                        (pk_val, min_ts, min_peer)
+                    )
+
+                # For each group with duplicates, identify losers
+                for group_key, group_rows in groups.items():
                     if len(group_rows) <= 1:
                         continue
                     # Winner: lowest (ts, peer_id)
@@ -581,10 +651,16 @@ class TeamAdapter(Adapter):
                     winner_pk = winner[0]
                     for pk_val, ts_val, peer_val in group_rows:
                         if pk_val != winner_pk:
-                            conn.execute(
-                                f"UPDATE {table} SET conflicted = 1 WHERE {pk_col} = ?",
-                                (pk_val,),
-                            )
+                            loser_pks.add(pk_val)
+
+            # Pass 2: Mark all losers conflicted at once
+            if loser_pks:
+                where_pk = " AND ".join(f"{pk} = ?" for pk in pk_cols)
+                for pk_val in loser_pks:
+                    conn.execute(
+                        f"UPDATE {table} SET conflicted = 1 WHERE {where_pk}",
+                        pk_val,
+                    )
         conn.commit()
 
     def snapshot_hash(self, peer_id: str) -> str:
@@ -605,7 +681,12 @@ class TeamAdapter(Adapter):
         for table in sorted(self.registered_tables.get(peer_id, [])):
             public_cols = self.public_columns[peer_id][table]
             pk_cols = self.pk_columns[peer_id][table]
-            unique_cols = self.unique_columns[peer_id].get(table, set())
+            unique_constraints = self.unique_columns[peer_id].get(table, [])
+
+            # Flatten all unique constraint columns for mangling
+            all_unique_cols: set[str] = set()
+            for constraint in unique_constraints:
+                all_unique_cols.update(constraint)
             
             cols_str = ", ".join(public_cols)
             order_by = ", ".join(pk_cols) if pk_cols else "rowid"
@@ -623,7 +704,7 @@ class TeamAdapter(Adapter):
                 # If conflicted, mangle the unique columns to prevent uniqueness violations
                 if is_conflicted == 1:
                     pk_val = "-".join(str(row_dict[pk]) for pk in pk_cols) if pk_cols else "unknown"
-                    for ucol in unique_cols:
+                    for ucol in all_unique_cols:
                         if row_dict.get(ucol) is not None:
                             row_dict[ucol] = f"{row_dict[ucol]}#conflict_{pk_val}"
                             

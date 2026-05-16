@@ -1,10 +1,64 @@
-# Changelog — CRDT Adapter Hardening (v3 + v4)
+# Changelog — CRDT Adapter (v1–v5)
 
 **Date:** 2026-05-16  
 **Branch:** `added-testcases`  
-**Files changed:** 4 files, +169 / −63 lines
+**Current Score:** 1.0000 / 1.0000 (L3 Final)
 
 ---
+
+## v5 — Engineering Review Fixes (2026-05-16)
+
+**Score:** 1.0000 → **1.0000 / 1.0000 (100%)** (maintained)  
+**Files changed:** `src/team_adapter.py`, `tests/test_task2.py`, `tests/test_task3.py`, `SPEC.md`, `requirements.txt`
+
+Five fixes from the pre-submission engineering review:
+
+### Fix 1: Composite UNIQUE stored as column-groups
+
+**Problem:** `UNIQUE(user_id, team_id)` was decomposed into a flat `set` — `{'user_id', 'team_id'}` — treating it as two independent single-column constraints. Two rows sharing `user_id` but differing on `team_id` would be falsely marked as conflicted.
+
+**Fix:** `unique_columns` type changed from `dict[str, set[str]]` to `dict[str, list[tuple[str, ...]]]`. A composite constraint is now stored as `[('user_id', 'team_id')]`. The uniqueness scan groups on the full tuple.
+
+### Fix 2: Bare `DELETE FROM table` (no WHERE clause)
+
+**Problem:** `DELETE FROM users` (without WHERE) did not match the DELETE regex (which required `WHERE`). It fell through to raw SQLite passthrough, physically destroying all rows — tombstones and metadata included. Only a stderr warning was emitted.
+
+**Fix:** Added a second regex: `DELETE\s+FROM\s+(\w+)\s*$`. Rewrites to `UPDATE table SET tombstone = 1, delete_ts = ? WHERE tombstone = 0`, tombstoning all live rows while preserving the physical data.
+
+### Fix 3: Two-pass uniqueness scan
+
+**Problem:** When a table had multiple unique constraints, the scan processed them sequentially. A row marked `conflicted=1` by the first constraint's scan was excluded from the second constraint's `WHERE conflicted = 0` query. If that row was the legitimate winner for the second constraint, the wrong winner was selected.
+
+**Fix:** Rewrote `_uniqueness_scan` with a two-pass approach:
+- **Pass 1:** Collect ALL loser PKs across ALL constraints (no writes yet).
+- **Pass 2:** Mark all losers `conflicted=1` at once.
+
+### Fix 4: FK validation after sync
+
+**Problem:** `PRAGMA foreign_keys = OFF` during sync was necessary to avoid transient FK violations, but the re-enable at the end had no validation. Any merge bug that produced an FK-invalid state was committed silently.
+
+**Fix:** Added `PRAGMA foreign_key_check` after `PRAGMA foreign_keys = ON`. Violations are logged as warnings.
+
+### Fix 5: Dead code removal and dependency manifest
+
+- Removed unused variables `ts_sum` and `pk_col_str` from `_uniqueness_scan`.
+- Created `requirements.txt` documenting stdlib-only dependencies.
+- Updated `SPEC.md` to match implementation (Remove-Wins doctrine, cascade policy, snapshot behavior, multi-column UPDATE, bare DELETE, composite UNIQUE).
+- Updated test assertions in `test_task2.py` and `test_task3.py` for new `unique_columns` type.
+
+### Verification (v5)
+
+| Check | Result |
+|-------|--------|
+| Unit + integration tests | **65/65 passing** ✅ |
+| L3 Benchmark score | **1.0000 / 1.0000 (100%)** ✅ |
+| Dead variables | **Zero** ✅ |
+| SPEC ↔ Code sync | **All deviations resolved** ✅ |
+
+---
+---
+
+## v4 — L3 Final Benchmark: 90% → 100% (2026-05-16)
 
 ## Files Modified
 

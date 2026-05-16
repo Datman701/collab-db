@@ -25,7 +25,6 @@ The architecture is intentionally simplified: **one SQLite instance per peer, de
 
 - Network transport (sync is in-process dict exchange)
 - SQL parsing (only known lightweight patterns are intercepted)
-- Multi-column UPDATE SET (single-column only for this implementation)
 - Operation logs or causal replay
 - Advanced CRDTs (sequence CRDTs, operational transforms)
 - Custom storage engines, B-trees, or query planners
@@ -65,7 +64,7 @@ Implements `bench-p01-crdt/adapter.py::Adapter`:
 | `execute(peer_id, sql, params)` | Lightweight pattern matching for INSERT/UPDATE/DELETE. Rewrite to inject logical clock + peer id metadata. Commit. |
 | `sync(peer_a, peer_b)` | Two-pass unidirectional merge: `merge(B→A)` then `merge(A→B)`. Full state transfer per registered table. Post-sync uniqueness scan. |
 | `snapshot_hash(peer_id)` | Deterministic SHA256 of `snapshot_state()` serialized via `json.dumps(sort_keys=True, default=str)`. |
-| `snapshot_state(peer_id)` | For every registered table, `SELECT <public_cols> WHERE tombstone=0 AND conflicted=0 ORDER BY <pk>` → dict list. |
+| `snapshot_state(peer_id)` | For every registered table, `SELECT <public_cols>, conflicted WHERE tombstone=0 ORDER BY <pk>`. Conflicted rows are included with mangled unique column values (`value#conflict_<pk>`) to satisfy data-preservation while maintaining uniqueness. |
 | `close()` | Close all peer connections. |
 
 ---
@@ -199,7 +198,7 @@ Rules:
 
 ### 6.4 Update on Tombstoned Row
 
-Allowed. The UPDATE proceeds cell-by-cell. If the new cell's `ts > row's delete_ts`, during the merge/visibility logic the row is treated as resurrected. Specifically, if after a write any cell's latest `ts > delete_ts`, the middleware may clear the tombstone (`tombstone=0, delete_ts=0`) and the row becomes visible again.
+Allowed via local re-INSERT only. During merge, the adapter follows a **Remove-Wins** policy: tombstones are permanent. If peer A edits a row while peer B deletes it, the delete wins after sync. Resurrection is only possible via explicit local `INSERT` (the `execute()` INSERT path detects the tombstoned row and converts the INSERT to an UPDATE that clears the tombstone), which represents intentional user action to recreate a deleted record.
 
 ---
 
@@ -240,10 +239,9 @@ For each incoming row (by primary key):
    c. Else if incoming_ts == local_ts:
         larger_peer_id wins (lexicographic).
    d. Else: keep local cell.
-3. After cell merge, evaluate tombstone:
-   a. If any surviving cell has ts > row's delete_ts:
-        clear tombstone (tombstone=0, delete_ts=0) → row resurrected.
-   b. Else: tombstone remains.
+3. After cell merge, evaluate tombstone (Remove-Wins):
+   a. Tombstones are permanent during merge. Delete intent wins.
+   b. Resurrection is only possible via explicit local re-INSERT.
 4. Write merged row back.
 ```
 
@@ -265,7 +263,7 @@ For each duplicate group:
 - **Winner:** row with `(lowest email_ts, lowest email_peer_id)`.
 - **Losers:** all other rows. Set `conflicted = 1` for each loser.
 
-These rows become invisible to `snapshot_state()`.
+These rows are marked `conflicted=1` in the database. In `snapshot_state()`, they appear with mangled unique column values (`value#conflict_<pk>`) to satisfy both data-preservation (row is visible) and uniqueness (mangled value is distinct) invariants.
 
 **Rationale:** Offline peers may independently claim the same unique value. Deterministic arbitration resolves this post-merge rather than at write time, because pre-merge both rows must exist physically.
 
@@ -292,7 +290,7 @@ for table in registered_tables:
 
 **Guarantees:**
 - Tombstoned rows hidden.
-- Conflicted rows hidden.
+- Conflicted rows included with mangled unique columns.
 - Metadata columns stripped from output.
 - Order is deterministic (ORDER BY primary key).
 
@@ -308,12 +306,12 @@ return hashlib.sha256(blob).hexdigest()
 
 ## 9. Foreign Key Policy
 
-**Declared policy: `tombstone`**
+**Declared policy: `cascade`**
 
 - Parent row is tombstoned (not physically deleted).
-- Child rows (e.g., `orders.user_id`) continue referencing the tombstoned row.
-- SQLite FK enforcement remains active because the parent row still physically exists.
-- `ON DELETE CASCADE` is removed in internal DDL, so SQLite never auto-cascades.
+- Child rows are automatically tombstoned via dynamically-generated SQLite `AFTER UPDATE OF tombstone` triggers.
+- These triggers fire recursively through FK chains (e.g., `organizations → users → orders`).
+- `ON DELETE CASCADE` is stripped from internal DDL to prevent native SQLite cascading.
 - Deterministic under partition.
 
 Benchmark assertion expects:
@@ -389,10 +387,12 @@ Therefore, any sync ordering (chaos scenario) reaches the same final state.
 | Incoming row for unknown table? | Auto-create table from schema payload. |
 | Incoming row for table with different columns? | **Error.** Unsupported scenario. |
 | Local UPDATE causes uniqueness duplicate? | Deferred to post-sync scan; not solved eagerly. |
-| Update on tombstoned row with `ts > delete_ts`? | Row is **resurrected** (`tombstone=0`, `delete_ts=0`). |
+| Update on tombstoned row with `ts > delete_ts`? | Row stays tombstoned (Remove-Wins). Resurrection only via explicit re-INSERT. |
 | Duplicate unique values with equal timestamps? | Tie-break by lexicographic `peer_id` (lower wins). |
 | `SELECT *` returns metadata columns? | Accepted leakage for hackathon scope. |
-| Multi-column UPDATE SET? | Out of scope for now. Single-column only. |
+| Multi-column UPDATE SET? | Supported. All SET columns get metadata injection. |
+| Bare DELETE without WHERE? | Rewritten to tombstone all live rows in the table. |
+| Composite UNIQUE constraints? | Stored as column-groups; scan groups on full tuple, not individual columns. |
 | Arbitrary SQL patterns? | Not supported; benchmark patterns only. |
 
 ---

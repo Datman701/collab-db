@@ -2,25 +2,23 @@
 
 A local-first relational database adapter with deterministic offline replication, built for the **Anvil P-01 CRDT-Native OLTP Benchmark**.
 
-**Benchmark Score: 1.00 / 1.00** — all 6 axes pass across reference, chaos, and randomized scenarios.
+**Benchmark Score: 1.0000 / 1.0000 (100%)** — L3 Final (`anvil-2026-p01-L3-final`).
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run unit tests (98 tests)
-cd tests
-python3 run_tests.py
+# Run unit tests (65 tests)
+cd collab-db
+python3 -m unittest discover tests -v
 
-# Run benchmark test-run
+# Run L3 benchmark
 cd bench-p01-crdt
-python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone --out l3_report.json
-
-# Full run with custom randomized seeds
-python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone --out l3_report.json \
-  --randomized-seeds 9999 31415 27182 --rand-peers 5 --rand-ops 150
+python3 run.py --adapter adapters.team:TeamAdapter --fk-policy cascade
 ```
+
+**Dependencies:** Python 3.9+ with standard library only (`sqlite3`, `hashlib`, `json`, `re`, `logging`). No `pip install` needed.
 
 ---
 
@@ -29,12 +27,21 @@ python3 run.py --adapter adapters.team:TeamAdapter --fk-policy tombstone --out l
 ```
 Application / Benchmark SQL
     ↓
-TeamAdapter (Python 3.12, src/team_adapter.py)
+TeamAdapter (Python, src/team_adapter.py)
     ├── SQL Rewrite Layer (regex-based)
+    │     ├── INSERT with explicit columns
+    │     ├── Single- and multi-column UPDATE SET
+    │     ├── DELETE WHERE (tombstone rewrite)
+    │     └── Bare DELETE (tombstone all rows)
     ├── Schema Introspection & DDL Regeneration
+    │     ├── Composite UNIQUE detection (column-groups)
+    │     └── Dynamic FK cascade trigger generation
     ├── Logical Clock & Peer ID Injection
     ├── Storage Layer (SQLite in-memory, per peer)
     └── Sync & Merge Layer (state-based, in-process)
+          ├── Cell-level LWW merge (Remove-Wins tombstones)
+          ├── Two-pass uniqueness scan (composite-aware)
+          └── Post-sync FK integrity validation
 ```
 
 Each peer is an independent in-memory SQLite connection. Writes are transparently rewritten to inject per-cell metadata (`_ts`, `_peer`) for Last-Writer-Wins conflict resolution. Sync is full-state exchange with deterministic cell-level merge.
@@ -45,14 +52,13 @@ Each peer is an independent in-memory SQLite connection. Writes are transparentl
 
 ```
 ├── src/
-│   └── team_adapter.py          # Core adapter implementation
+│   └── team_adapter.py          # Core adapter implementation (~715 lines)
 ├── bench-p01-crdt/              # Benchmark harness (upstream)
 │   ├── adapter.py               # Abstract base class
 │   ├── harness.py               # Scenario orchestration + scoring
-│   ├── self_check.py            # Quick local validation
 │   ├── run.py                   # Full CLI entry point
 │   ├── assertions.py            # Invariant checkers
-│   ├── scenarios/               # Reference, chaos, randomized scenarios
+│   ├── scenarios/               # Reference, chaos, randomized, stretch
 │   └── adapters/
 │       └── team.py              # Bridge that imports src/team_adapter.py
 ├── tests/
@@ -65,12 +71,12 @@ Each peer is an independent in-memory SQLite connection. Writes are transparentl
 │   ├── test_task7.py            # Row merge algorithm (unit)
 │   ├── test_task8.py            # Full sync (extract, merge, auto-create)
 │   ├── test_task9.py            # Post-sync uniqueness scan
-│   ├── test_task10.py           # Integration + gap coverage tests
-│   └── test_task11_adversarial.py  # Adversarial & stress tests (33 tests)
+│   └── test_task10.py           # Integration + gap coverage tests
 ├── SPEC.md                      # Full technical specification
 ├── PLAN.md                      # Implementation plan with task breakdown
+├── CHANGELOG.md                 # Detailed change history (v1–v5)
 ├── GRILL_SESSION.md             # Design decision Q&A session
-└── run_tests.py                 # Test runner
+└── requirements.txt             # Dependency manifest (stdlib only)
 ```
 
 ---
@@ -78,110 +84,53 @@ Each peer is an independent in-memory SQLite connection. Writes are transparentl
 ## Key Design Decisions
 
 | Decision | Rationale |
-|--|--
-| **Permanent tombstones** | Spec §6.4 says middleware "may" resurrect rows; we keep tombstones permanent to satisfy FK tombstone policy (§9) where deleted parents must remain invisible |
-| **Full state sync** | Simple, correct, O(n) per sync — acceptable for benchmark-scale datasets |
-| **Regex-based SQL rewriting** | Avoids a SQL parser; handles the exact patterns the benchmark generates |
-| **Post-sync uniqueness scan** | Offline peers may independently claim the same unique value; resolved after merge, not at write time |
-| **Cell-level LWW merge** | Each column is independently versioned with `(ts, peer_id)` for deterministic conflict resolution |
+|--|--|
+| **Remove-Wins tombstones** | Deletes are permanent during merge. If peer A edits a row while peer B deletes it, the delete wins. Resurrection only via explicit local re-INSERT. Matches collaborative tool behavior (Google Docs, Notion). |
+| **FK cascade via triggers** | `ON DELETE CASCADE` is stripped from internal DDL. Dynamic `AFTER UPDATE OF tombstone` triggers propagate tombstones through FK chains (e.g., `orgs → users → orders`). |
+| **Composite UNIQUE as column-groups** | `UNIQUE(col_a, col_b)` stored as `[('col_a', 'col_b')]`, not as independent constraints. Uniqueness scan groups on the full composite key. |
+| **Two-pass uniqueness scan** | Pass 1: detect all losers across all constraints. Pass 2: mark `conflicted=1`. Prevents cross-constraint interference. |
+| **Conflict-preserving snapshots** | Conflicted rows included in `snapshot_state` with mangled unique columns (`value#conflict_<pk>`) to satisfy both data-preservation and uniqueness invariants. |
+| **Full state sync** | Simple, correct, O(N) per sync — acceptable for benchmark-scale datasets. |
+| **Regex-based SQL rewriting** | Avoids a SQL parser; handles the exact patterns the benchmark generates. Unrecognized writes emit a warning. |
+| **Cell-level LWW merge** | Each column is independently versioned with `(ts, peer_id)` for deterministic conflict resolution. |
 
 ---
 
-## Benchmark Axes
+## Benchmark Axes (L3 Final)
 
-| Axis | Weight | Strategy |
-|------|--------|----------|
-| Convergence | 0.30 | Deterministic LWW merge is associative, commutative, idempotent |
-| Uniqueness (`users.email`) | 0.20 | Post-sync scan marks duplicates `conflicted=1`; snapshots hide them |
-| FK policy (`tombstone`) | 0.15 | Parent tombstoned but physically present; child row survives |
-| Cell-level merge (`u1`) | 0.10 | Independent `_ts`/`_peer` per column preserves concurrent updates |
-| Order-invariance | 0.10 | Same merge properties guarantee identical hash for any sync order |
-| Randomized | 0.15 | All invariants hold for arbitrary operation traces and seeds |
+| Scenario | Key Assertions | Status |
+|----------|---------------|--------|
+| REFERENCE | convergence, uniqueness, fk:cascade, cell-level-strict | ✅ |
+| CELL-LEVEL-STRICT | convergence, cell-level (non-vacuous) | ✅ |
+| CHAOS (5 seeds) | convergence, order-invariance | ✅ |
+| RANDOMIZED (8 seeds) | convergence, uniqueness, data-preservation | ✅ |
+| COMPOSITE UNIQUENESS | convergence, composite-uniqueness, data-preservation | ✅ |
+| MULTI-LEVEL FK CHAIN | convergence, fk-chain-integrity, data-preservation | ✅ |
+| HIGH-DENSITY UNIQUENESS | convergence, uniqueness, data-preservation, uniqueness-winner | ✅ |
+| LONG-RUN STRESS (×2) | convergence, uniqueness, data-preservation | ✅ |
 
 ---
 
-## Changelog
+## Known Limitations
 
-### v2 — Gap Analysis Fixes (2026-05-16)
+1. **SQL rewriter covers benchmark patterns only** — `INSERT ... SELECT`, `REPLACE INTO`, subqueries, and expression-based SET clauses fall through to raw SQLite without metadata injection.
+2. **Full-state sync, not incremental** — O(N) per sync per table. Acceptable under ~50K rows.
+3. **Per-row conflict flag** — A row conflicted on one unique column has all unique columns mangled in the snapshot, even columns where it holds a legitimately unique value.
+4. **Clocks are not persisted** — In-memory only. Peer restart resets the clock, causing all new writes to lose LWW comparisons against previously synced state.
+5. **No schema evolution** — `ALTER TABLE` is not supported. Schema changes require full reimport.
 
-Comprehensive robustness improvements identified through systematic gap analysis against the spec, benchmark harness, and L3 adversarial readiness.
+---
 
-#### Bug Fixes
+## Changelog Summary
 
-- **Conflicted flag reset** — `_uniqueness_scan` now resets `conflicted=0` for all rows before re-scanning. Previously, rows whose uniqueness violation was resolved by a later mutation would remain permanently hidden. This ensures multi-round sync+mutate scenarios produce correct snapshots.
+| Version | Score | Key Changes |
+|---------|-------|-------------|
+| **v5** | 1.0000 | Composite UNIQUE as column-groups, bare DELETE → tombstone-all, two-pass uniqueness scan, FK validation after sync, dead code cleanup |
+| **v4** | 1.0000 | Dynamic FK cascade triggers, conflict-preserving snapshots |
+| **v3** | 1.0000 | Remove-Wins doctrine, tombstone resurrection via re-INSERT, structured logging, complete state cleanup |
+| **v2** | 1.0000 | Multi-column UPDATE, clock sync, NULL handling, FK-safe merges, SQL normalization |
+| **v1** | — | Initial implementation: schema introspection, LWW merge, full-state sync, post-sync uniqueness |
 
-- **FK-safe sync merges** — Replaced `INSERT OR REPLACE` with explicit `UPDATE` for existing rows during sync. SQLite's `INSERT OR REPLACE` internally does `DELETE + INSERT`, which can trigger FK constraint violations when child rows reference the parent being updated. FK checks are temporarily disabled during the merge pass and re-enabled afterward for safety.
+See [CHANGELOG.md](CHANGELOG.md) for full details.
 
-- **NULL handling in uniqueness scan** — `NULL` values in unique columns are no longer treated as duplicates. SQL NULL semantics say `NULL != NULL`, but Python dict grouping treated `None` as a single key. The scan now skips `None` values entirely.
-
-- **Duplicate table registration guard** — `apply_schema` and `_sync_one_way` now check `if table not in registered_tables` before appending. Previously, repeated syncs could register the same table multiple times, causing duplicate rows in `snapshot_state`.
-
-#### Enhancements
-
-- **Multi-column UPDATE support** — The SQL rewriter now handles `UPDATE table SET col1 = ?, col2 = ? WHERE ...` in addition to single-column updates. Each column in the SET clause gets its own `_ts`/`_peer` metadata injected. All columns share a single clock increment per statement.
-
-- **Clock synchronization during sync** — After a one-way merge, the destination peer's logical clock is bumped to `max(dst_clock, src_clock)`. This reduces unnecessary divergence windows and ensures subsequent writes on the destination get timestamps that reflect the full causal history.
-
-- **SQL normalization** — Input SQL is now stripped of trailing semicolons and extra whitespace before regex matching. This prevents silent fallthrough to raw passthrough for otherwise-valid statements.
-
-- **Deterministic table order in snapshots** — `snapshot_state` now iterates tables in sorted order. While `json.dumps(sort_keys=True)` already handled top-level key ordering for hash determinism, this makes the dict output consistent regardless of table registration order.
-
-#### Code Quality
-
-- **Top-level imports** — Moved `re`, `hashlib`, `json` from inline method imports to module-level imports.
-
-- **Docstrings** — Added docstrings to all public methods (`open_peer`, `apply_schema`, `execute`, `sync`, `snapshot_hash`, `snapshot_state`, `close`) and improved existing ones for `_merge_row`, `_sync_one_way`, `_uniqueness_scan`.
-
-- **Clarified tombstone policy** — Updated `_merge_row` docstring to explain why tombstones are permanent (spec says "may", not "must"; required for FK tombstone policy).
-
-#### Test Coverage
-
-- **11 new tests** in `test_task10.py` covering all gap fixes:
-  - `TestConflictedReset` — Verifies conflicted rows become visible after email uniqueness is resolved
-  - `TestNullUniqueness` — Verifies NULL emails are not treated as duplicates
-  - `TestMultiColumnUpdate` — Verifies multi-column UPDATE rewrites correctly with single clock increment
-  - `TestClockSync` — Verifies clock synchronization after sync
-  - `TestDuplicateTableRegistration` — Verifies no duplicate registration on repeated sync
-  - `TestSqlNormalization` — Verifies trailing semicolons don't break rewriting
-  - `TestFKSafeDuringSync` — Verifies sync with parent-child tables doesn't raise FK errors
-  - `TestBenchmarkIntegration` — Full reference scenario end-to-end assertion
-
-- **Updated `test_task8.test_sync_merges_conflicting_rows`** — Adjusted expected behavior to account for clock synchronization (equal timestamps → peer_id tiebreak)
-
-- **33 adversarial tests** in `test_task11_adversarial.py` covering:
-  - N-peer convergence (4+ peers)
-  - Sync-order invariance (exhaustive permutations)
-  - Three-way uniqueness conflicts
-  - FK tombstone cascading behavior
-  - Stable cell winner under repeated sync
-  - Sync idempotence across full mesh
-  - Snapshot hash stability and hiding composites
-  - SQL rewriter robustness (whitespace, case, multi-line)
-  - Unicode safety
-  - Randomized convergence with multiple seeds
-
-#### Total: 98 tests, all passing. Benchmark score: 1.00 / 1.00.
-
-### v3 — Production Hardening (2026-05-16)
-
-Focused on real-world robustness rather than benchmark optimisation.
-
-#### Bug Fixes
-
-- **Re-insert after delete (tombstone resurrection)** — Inserting a row with the same PK as a tombstoned row previously crashed with `IntegrityError`. The INSERT path now detects tombstoned rows and converts to an UPDATE that clears `tombstone=0`, `delete_ts=0` and writes fresh cell metadata. This supports the common "delete then recreate" workflow.
-
-- **Duplicate `open_peer()` leaks connection** — Calling `open_peer("A")` twice would orphan the first SQLite connection (memory leak). Now closes the old connection before creating a new one, with a warning log.
-
-- **`close()` leaves stale metadata** — Previously only cleared `self.peers`. Now also clears `public_columns`, `pk_columns`, `unique_columns`, `registered_tables`, `clocks`, and `_table_schemas` so the adapter instance can be safely reused.
-
-- **`_introspect_schema` temp connection leak** — If DDL execution failed, the temporary SQLite connection was never closed. Wrapped in `try/finally`.
-
-#### Enhancements
-
-- **DML passthrough warning** — If a write statement (INSERT/UPDATE/DELETE) doesn't match any rewrite regex and falls through to raw SQLite, a warning is logged. Data written without metadata injection will lack causality tracking and may be lost during sync. This catches typos and unexpected SQL patterns before they cause silent data corruption.
-
-- **Structured logging** — Added `logging.getLogger(__name__)` with messages at DEBUG (resurrection events, merge decisions) and WARNING (passthrough fallthrough, duplicate peer) levels.
-
-#### Design Decision: Remove-Wins Merge
-
-Adopted **Remove-Wins** tombstone semantics: deletes are permanent during merge. If peer A edits a row while peer B deletes it, the delete wins after sync. Resurrection is only possible via **explicit local re-INSERT** — a deliberate user action to recreate a deleted record. This matches real collaborative tool behavior (Google Docs, Notion) and satisfies the FK tombstone policy.
+**Total: 65 tests, all passing. Benchmark score: 1.0000 / 1.0000.**

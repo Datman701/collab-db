@@ -1,0 +1,7 @@
+# CRDT Relational Database Adapter — Dependencies
+#
+# This project uses Python standard library only. No external packages required.
+# Tested with Python 3.9+.
+#
+# Standard library modules used:
+#   sqlite3, hashlib, json, re, logging, os, sys
