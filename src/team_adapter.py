@@ -13,6 +13,8 @@ import os
 import re
 import sqlite3
 import sys
+import threading
+import uuid
 from typing import Any
 
 # When this module is imported from within bench-p01-crdt/adapters/team.py,
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class TeamAdapter(Adapter):
-    def __init__(self) -> None:
+    def __init__(self, peer_db_paths: dict[str, str] | None = None) -> None:
         self.peers: dict[str, sqlite3.Connection] = {}
         self.public_columns: dict[str, dict[str, list[str]]] = {}
         self.pk_columns: dict[str, dict[str, list[str]]] = {}
@@ -36,6 +38,8 @@ class TeamAdapter(Adapter):
         self.registered_tables: dict[str, list[str]] = {}
         self.clocks: dict[str, int] = {}
         self._table_schemas: dict[str, dict] = {}
+        self._peer_db_paths: dict[str, str] = peer_db_paths or {}
+        self._lock = threading.RLock()
 
     def open_peer(self, peer_id: str) -> None:
         """Initialise an independent peer with the given id and empty state.
@@ -43,21 +47,26 @@ class TeamAdapter(Adapter):
         If a peer with the same id already exists, the old connection is
         closed first to prevent resource leaks.
         """
-        if peer_id in self.peers:
-            logger.warning("open_peer(%r): peer already exists, closing old connection", peer_id)
-            try:
-                self.peers[peer_id].close()
-            except Exception:
-                pass  # Best-effort cleanup
+        with self._lock:
+            if peer_id in self.peers:
+                logger.warning("open_peer(%r): peer already exists, closing old connection", peer_id)
+                try:
+                    self.peers[peer_id].close()
+                except Exception:
+                    pass  # Best-effort cleanup
 
-        conn = sqlite3.connect(":memory:")
-        conn.execute("PRAGMA foreign_keys = ON")
-        self.peers[peer_id] = conn
-        self.public_columns[peer_id] = {}
-        self.pk_columns[peer_id] = {}
-        self.unique_columns[peer_id] = {}
-        self.registered_tables[peer_id] = []
-        self.clocks[peer_id] = 0
+            db_path = self._peer_db_paths.get(peer_id)
+            if db_path:
+                conn = sqlite3.connect(db_path, check_same_thread=False)
+            else:
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
+            conn.execute("PRAGMA foreign_keys = ON")
+            self.peers[peer_id] = conn
+            self.public_columns[peer_id] = {}
+            self.pk_columns[peer_id] = {}
+            self.unique_columns[peer_id] = {}
+            self.registered_tables[peer_id] = []
+            self.clocks[peer_id] = 0
 
     def _introspect_schema(self, ddl: str) -> dict:
         """Introspect a CREATE TABLE DDL and return internal schema info.
@@ -171,29 +180,30 @@ class TeamAdapter(Adapter):
         CREATE TABLE statements are intercepted, introspected, and regenerated
         with metadata columns. CREATE INDEX passes through unchanged.
         """
-        conn = self.peers[peer_id]
-        for stmt in stmts:
-            stmt_stripped = stmt.strip()
-            if re.match(r'CREATE\s+TABLE', stmt_stripped, re.IGNORECASE):
-                info = self._introspect_schema(stmt_stripped)
-                table_name = re.search(r'CREATE\s+TABLE\s+(\w+)', stmt_stripped, re.IGNORECASE).group(1)
-                conn.execute(info['internal_ddl'])
-                for trigger in info.get('triggers', []):
-                    conn.execute(trigger)
-                self.public_columns[peer_id][table_name] = info['public_columns']
-                self.pk_columns[peer_id][table_name] = info['pk_columns']
-                self.unique_columns[peer_id][table_name] = info['unique_columns']
-                # Prevent duplicate table registration
-                if table_name not in self.registered_tables[peer_id]:
-                    self.registered_tables[peer_id].append(table_name)
-                # Store globally for auto-creation during sync
-                self._table_schemas[table_name] = info
-            elif re.match(r'CREATE\s+INDEX', stmt_stripped, re.IGNORECASE):
-                conn.execute(stmt_stripped)
-            else:
-                # Unsupported DDL — pass through for now
-                conn.execute(stmt_stripped)
-        conn.commit()
+        with self._lock:
+            conn = self.peers[peer_id]
+            for stmt in stmts:
+                stmt_stripped = stmt.strip()
+                if re.match(r'CREATE\s+TABLE', stmt_stripped, re.IGNORECASE):
+                    info = self._introspect_schema(stmt_stripped)
+                    table_name = re.search(r'CREATE\s+TABLE\s+(\w+)', stmt_stripped, re.IGNORECASE).group(1)
+                    conn.execute(info['internal_ddl'])
+                    for trigger in info.get('triggers', []):
+                        conn.execute(trigger)
+                    self.public_columns[peer_id][table_name] = info['public_columns']
+                    self.pk_columns[peer_id][table_name] = info['pk_columns']
+                    self.unique_columns[peer_id][table_name] = info['unique_columns']
+                    # Prevent duplicate table registration
+                    if table_name not in self.registered_tables[peer_id]:
+                        self.registered_tables[peer_id].append(table_name)
+                    # Store globally for auto-creation during sync
+                    self._table_schemas[table_name] = info
+                elif re.match(r'CREATE\s+INDEX', stmt_stripped, re.IGNORECASE):
+                    conn.execute(stmt_stripped)
+                else:
+                    # Unsupported DDL — pass through for now
+                    conn.execute(stmt_stripped)
+            conn.commit()
 
     def execute(self, peer_id: str, sql: str, params: tuple[Any, ...] = ()) -> None:
         """Execute a single DML statement locally on a peer.
@@ -207,161 +217,171 @@ class TeamAdapter(Adapter):
         injection. This will log a warning because the data will lack
         causality tracking and will be lost or corrupted during sync.
         """
-        conn = self.peers[peer_id]
-        peer = peer_id
+        with self._lock:
+            conn = self.peers[peer_id]
+            peer = peer_id
 
-        # Normalize: strip trailing semicolons and extra whitespace
-        sql_clean = sql.strip().rstrip(';').strip()
+            # Normalize: strip trailing semicolons and extra whitespace
+            sql_clean = sql.strip().rstrip(';').strip()
 
-        # Try INSERT rewrite
-        insert_match = re.match(
-            r"INSERT\s+INTO\s+(\w+)\s+\(([^)]+)\)\s+VALUES\s+\(([^)]+)\)",
-            sql_clean,
-            re.IGNORECASE,
-        )
-        if insert_match:
-            table_name = insert_match.group(1)
-            public_cols = [c.strip() for c in insert_match.group(2).split(",")]
-            placeholders = [p.strip() for p in insert_match.group(3).split(",")]
+            # Try INSERT rewrite
+            insert_match = re.match(
+                r"INSERT\s+INTO\s+(\w+)\s+\(([^)]+)\)\s+VALUES\s+\(([^)]+)\)",
+                sql_clean,
+                re.IGNORECASE,
+            )
+            if insert_match:
+                table_name = insert_match.group(1)
+                public_cols = [c.strip() for c in insert_match.group(2).split(",")]
+                placeholders = [p.strip() for p in insert_match.group(3).split(",")]
 
-            pk_cols = self.pk_columns[peer_id].get(table_name, [])
+                pk_cols = self.pk_columns[peer_id].get(table_name, [])
 
-            new_cols = []
-            new_placeholders = []
-            new_params = []
+                new_cols = []
+                new_placeholders = []
+                new_params = []
 
-            self.clocks[peer_id] += 1
-            ts = self.clocks[peer_id]
-
-            for i, col in enumerate(public_cols):
-                new_cols.append(col)
-                new_placeholders.append(placeholders[i])
-                new_params.append(params[i])
-                if col not in pk_cols:
-                    new_cols.append(f"{col}_ts")
-                    new_cols.append(f"{col}_peer")
-                    new_placeholders.append("?")
-                    new_placeholders.append("?")
-                    new_params.append(ts)
-                    new_params.append(peer)
-
-            rewritten_sql = f"INSERT INTO {table_name} ({', '.join(new_cols)}) VALUES ({', '.join(new_placeholders)})"
-            try:
-                conn.execute(rewritten_sql, tuple(new_params))
-            except sqlite3.IntegrityError:
-                # PK already exists — likely a tombstoned row. Check and
-                # resurrect: convert INSERT to UPDATE that clears tombstone
-                # and overwrites all mutable columns with fresh values.
-                pk_values = [params[i] for i, c in enumerate(public_cols) if c in pk_cols]
-                if pk_values:
-                    where = " AND ".join(f"{pk} = ?" for pk in pk_cols)
-                    cur = conn.execute(
-                        f"SELECT tombstone FROM {table_name} WHERE {where}",
-                        pk_values,
-                    )
-                    existing = cur.fetchone()
-                    if existing and existing[0] == 1:
-                        # Row is tombstoned — resurrect via UPDATE
-                        logger.debug("Resurrecting tombstoned row %s in %s via re-insert",
-                                     pk_values, table_name)
-                        mutable_cols = [c for c in public_cols if c not in pk_cols]
-                        set_parts = []
-                        set_params = []
-                        param_map = {c: params[i] for i, c in enumerate(public_cols)}
-                        for col in mutable_cols:
-                            set_parts.append(f"{col} = ?")
-                            set_parts.append(f"{col}_ts = ?")
-                            set_parts.append(f"{col}_peer = ?")
-                            set_params.extend([param_map[col], ts, peer])
-                        set_parts.append("tombstone = 0")
-                        set_parts.append("delete_ts = 0")
-                        set_parts.append("conflicted = 0")
-                        conn.execute(
-                            f"UPDATE {table_name} SET {', '.join(set_parts)} WHERE {where}",
-                            tuple(set_params) + tuple(pk_values),
-                        )
-                    else:
-                        # Row exists and is not tombstoned — genuine PK conflict
-                        raise
-                else:
-                    raise
-            conn.commit()
-            return
-
-        # Try UPDATE rewrite — supports single- and multi-column SET
-        update_match = re.match(
-            r"UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+)",
-            sql_clean,
-            re.IGNORECASE | re.DOTALL,
-        )
-        if update_match:
-            table_name = update_match.group(1)
-            set_clause = update_match.group(2).strip()
-            where_clause = update_match.group(3).strip()
-
-            # Parse SET assignments: "col1 = ?, col2 = ?" → [col1, col2]
-            assignments = [a.strip() for a in set_clause.split(",")]
-            set_cols = []
-            for assignment in assignments:
-                col_match = re.match(r"(\w+)\s*=\s*\?", assignment)
-                if col_match:
-                    set_cols.append(col_match.group(1))
-                else:
-                    # Non-standard SET pattern — fall through to raw passthrough
-                    set_cols = None
-                    break
-
-            if set_cols:
                 self.clocks[peer_id] += 1
                 ts = self.clocks[peer_id]
 
-                # Build new SET clause with metadata for each column
-                new_set_parts = []
-                new_params_list = []
-                param_idx = 0
-                for col in set_cols:
-                    new_set_parts.append(f"{col} = ?")
-                    new_set_parts.append(f"{col}_ts = ?")
-                    new_set_parts.append(f"{col}_peer = ?")
-                    new_params_list.append(params[param_idx])
-                    new_params_list.append(ts)
-                    new_params_list.append(peer)
-                    param_idx += 1
+                for i, col in enumerate(public_cols):
+                    new_cols.append(col)
+                    new_placeholders.append(placeholders[i])
+                    new_params.append(params[i])
+                    if col not in pk_cols:
+                        new_cols.append(f"{col}_ts")
+                        new_cols.append(f"{col}_peer")
+                        new_placeholders.append("?")
+                        new_placeholders.append("?")
+                        new_params.append(ts)
+                        new_params.append(peer)
 
-                rewritten_sql = f"UPDATE {table_name} SET {', '.join(new_set_parts)} WHERE {where_clause}"
-                # Append remaining params (WHERE clause params)
-                new_params_tuple = tuple(new_params_list) + params[param_idx:]
-                conn.execute(rewritten_sql, new_params_tuple)
+                rewritten_sql = f"INSERT INTO {table_name} ({', '.join(new_cols)}) VALUES ({', '.join(new_placeholders)})"
+                try:
+                    conn.execute(rewritten_sql, tuple(new_params))
+                except sqlite3.IntegrityError:
+                    # PK already exists — likely a tombstoned row. Check and
+                    # resurrect: convert INSERT to UPDATE that clears tombstone
+                    # and overwrites all mutable columns with fresh values.
+                    pk_values = [params[i] for i, c in enumerate(public_cols) if c in pk_cols]
+                    if pk_values:
+                        where = " AND ".join(f"{pk} = ?" for pk in pk_cols)
+                        cur = conn.execute(
+                            f"SELECT tombstone FROM {table_name} WHERE {where}",
+                            pk_values,
+                        )
+                        existing = cur.fetchone()
+                        if existing and existing[0] == 1:
+                            # Row is tombstoned — resurrect via UPDATE
+                            logger.debug("Resurrecting tombstoned row %s in %s via re-insert",
+                                         pk_values, table_name)
+                            mutable_cols = [c for c in public_cols if c not in pk_cols]
+                            set_parts = []
+                            set_params = []
+                            param_map = {c: params[i] for i, c in enumerate(public_cols)}
+                            for col in mutable_cols:
+                                set_parts.append(f"{col} = ?")
+                                set_parts.append(f"{col}_ts = ?")
+                                set_parts.append(f"{col}_peer = ?")
+                                set_params.extend([param_map[col], ts, peer])
+                            set_parts.append("tombstone = 0")
+                            set_parts.append("delete_ts = 0")
+                            set_parts.append("conflicted = 0")
+                            conn.execute(
+                                f"UPDATE {table_name} SET {', '.join(set_parts)} WHERE {where}",
+                                tuple(set_params) + tuple(pk_values),
+                            )
+                        else:
+                            # Row exists and is not tombstoned — genuine PK conflict
+                            raise
+                    else:
+                        raise
                 conn.commit()
                 return
 
-        # Try DELETE rewrite (tombstone UPDATE)
-        delete_match = re.match(
-            r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+(.+)",
-            sql_clean,
-            re.IGNORECASE,
-        )
-        if delete_match:
-            table_name = delete_match.group(1)
-            where_clause = delete_match.group(2)
+            # Try UPDATE rewrite — supports single- and multi-column SET
+            update_match = re.match(
+                r"UPDATE\s+(\w+)\s+SET\s+(.+?)\s+WHERE\s+(.+)",
+                sql_clean,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if update_match:
+                table_name = update_match.group(1)
+                set_clause = update_match.group(2).strip()
+                where_clause = update_match.group(3).strip()
 
-            self.clocks[peer_id] += 1
-            ts = self.clocks[peer_id]
+                # Parse SET assignments: "col1 = ?, col2 = ?" → [col1, col2]
+                assignments = [a.strip() for a in set_clause.split(",")]
+                set_cols = []
+                for assignment in assignments:
+                    col_match = re.match(r"(\w+)\s*=\s*\?", assignment)
+                    if col_match:
+                        set_cols.append(col_match.group(1))
+                    else:
+                        # Non-standard SET pattern — fall through to raw passthrough
+                        set_cols = None
+                        break
 
-            rewritten_sql = f"UPDATE {table_name} SET tombstone = 1, delete_ts = ? WHERE {where_clause}"
-            new_params = (ts,) + params
-            conn.execute(rewritten_sql, new_params)
+                if set_cols:
+                    self.clocks[peer_id] += 1
+                    ts = self.clocks[peer_id]
+
+                    # Build new SET clause with metadata for each column
+                    new_set_parts = []
+                    new_params_list = []
+                    param_idx = 0
+                    for col in set_cols:
+                        new_set_parts.append(f"{col} = ?")
+                        new_set_parts.append(f"{col}_ts = ?")
+                        new_set_parts.append(f"{col}_peer = ?")
+                        new_params_list.append(params[param_idx])
+                        new_params_list.append(ts)
+                        new_params_list.append(peer)
+                        param_idx += 1
+
+                    rewritten_sql = f"UPDATE {table_name} SET {', '.join(new_set_parts)} WHERE {where_clause}"
+                    # Append remaining params (WHERE clause params)
+                    new_params_tuple = tuple(new_params_list) + params[param_idx:]
+                    conn.execute(rewritten_sql, new_params_tuple)
+                    conn.commit()
+                    return
+
+            # Try DELETE rewrite (tombstone UPDATE)
+            delete_match = re.match(
+                r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+(.+)",
+                sql_clean,
+                re.IGNORECASE,
+            )
+            if delete_match:
+                table_name = delete_match.group(1)
+                where_clause = delete_match.group(2)
+
+                self.clocks[peer_id] += 1
+                ts = self.clocks[peer_id]
+
+                rewritten_sql = f"UPDATE {table_name} SET tombstone = 1, delete_ts = ? WHERE {where_clause}"
+                new_params = (ts,) + params
+                conn.execute(rewritten_sql, new_params)
+                conn.commit()
+                return
+
+            # Passthrough — warn if this looks like a write operation that
+            # should have been rewritten (data will lack metadata tracking)
+            sql_upper = sql_clean.split()[0].upper() if sql_clean else ""
+            if sql_upper in ("INSERT", "UPDATE", "DELETE"):
+                print(f"WARNING: DML statement fell through to raw passthrough: {sql_clean[:120]}", file=sys.stderr)
+
+            conn.execute(sql, params)
             conn.commit()
-            return
 
-        # Passthrough — warn if this looks like a write operation that
-        # should have been rewritten (data will lack metadata tracking)
-        sql_upper = sql_clean.split()[0].upper() if sql_clean else ""
-        if sql_upper in ("INSERT", "UPDATE", "DELETE"):
-            print(f"WARNING: DML statement fell through to raw passthrough: {sql_clean[:120]}", file=sys.stderr)
-
-        conn.execute(sql, params)
-        conn.commit()
+    def query(self, peer_id: str, sql: str, params: tuple[Any, ...] = ()) -> tuple[list[str], list[tuple[Any, ...]]]:
+        """Execute a SQL query on a peer and return column names and rows."""
+        with self._lock:
+            conn = self.peers[peer_id]
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+            columns = [d[0] for d in cur.description] if cur.description else []
+            return columns, rows
 
     def _merge_row(self, incoming: dict, local: dict, mutable_cols: list[str]) -> dict:
         """Merge two row dicts using per-cell LWW. Returns merged row dict.

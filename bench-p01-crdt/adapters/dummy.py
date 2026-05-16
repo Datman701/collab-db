@@ -46,6 +46,18 @@ class DummyAdapter(Adapter):
         except sqlite3.IntegrityError:
             pass
 
+    def query(
+        self,
+        peer_id: str,
+        sql: str,
+        params: tuple[Any, ...] = (),
+    ) -> tuple[list[str], list[tuple[Any, ...]]]:
+        conn = self.peers[peer_id]
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        columns = [d[0] for d in cur.description] if cur.description else []
+        return columns, rows
+
     def sync(self, peer_a: str, peer_b: str) -> None:
         for src, dst in [(peer_b, peer_a), (peer_a, peer_b)]:
             state = self.snapshot_state(src)

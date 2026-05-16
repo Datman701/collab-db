@@ -29,6 +29,10 @@ class Adapter(ABC):
         """Execute a single DML statement locally on a peer. No sync."""
 
     @abstractmethod
+    def query(self, peer_id: str, sql: str, params: tuple[Any, ...] = ()) -> tuple[list[str], list[tuple[Any, ...]]]:
+        """Execute a SQL query and return column names plus rows."""
+
+    @abstractmethod
     def sync(self, peer_a: str, peer_b: str) -> None:
         """Pairwise bidirectional sync. After return, both peers reflect
         the union of each other's known state per the engine's merge semantics."""
